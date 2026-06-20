@@ -1,12 +1,16 @@
-import { Effect, Context, Layer, Option, Schema } from "effect"
+import { Effect, Context, Layer, Option } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Wallet } from "@opencode-ai/core/wallet"
-import { AdConfig, AdCreative, CREDITS_PER_VIEW, SLOT_MIN_DURATIONS } from "@opencode-ai/core/ad/types"
+import { AdConfig } from "@opencode-ai/core/ad/types"
 import { shouldShowAd, selectAd, formatAdAsMarkdown, trackImpression } from "@opencode-ai/core/ad/injector"
 import { fetchAds, recordImpression } from "@opencode-ai/core/ad/service"
 import { AD_VIEW_CREDIT_REWARD } from "@opencode-ai/core/wallet/config"
+import { Database } from "@opencode-ai/core/database/database"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Account } from "@/account/account"
-import { PartID } from "./schema"
+import { Config } from "@/config/config"
+import { EventV2Bridge } from "@/event-v2-bridge"
+import { PartID, SessionID } from "./schema"
 
 type AdSlotType = "thinking" | "toolgap" | "idle"
 
@@ -38,30 +42,26 @@ function incrementAdCount(sessionID: string): void {
   adCountsThisHour[sessionID] = getAdCountThisHour(sessionID) + 1
 }
 
-function resolveUserID(): Effect.Effect<string | undefined> {
-  return Account.Service.pipe(
-    Effect.flatMap((svc) => svc.active()),
-    Effect.map((opt) => {
-      if (Option.isSome(opt)) return opt.value.id
-      return undefined
-    }),
-    Effect.catchAll(() => Effect.succeed(undefined)),
-  )
-}
-
 // --- Interface ---
+//
+// sessionID/messageID are the branded id types the processor already holds (ctx.sessionID and the
+// assistant message id), which are exactly the branded fields on SessionV1.TextPart. Typing them as
+// branded (not plain string) keeps the synthetic part construction type-safe without runtime
+// coercion. applyUsage's error channel is declared honestly: debitWallet can fail with
+// WalletNotFoundError | InsufficientBalanceError; the processor wraps the call so a failure never
+// breaks the session.
 
 export interface Interface {
   readonly maybeShowAd: (
-    sessionID: string,
-    messageID: string,
+    sessionID: SessionID,
+    messageID: SessionV1.MessageID,
     slotType: AdSlotType,
     publishPart: (part: SessionV1.TextPart) => Effect.Effect<SessionV1.TextPart>,
   ) => Effect.Effect<void>
   readonly applyUsage: (
-    sessionID: string,
+    sessionID: SessionID,
     costUSD: number,
-  ) => Effect.Effect<number>
+  ) => Effect.Effect<number, Wallet.WalletNotFoundError | Wallet.InsufficientBalanceError>
 }
 
 // --- Service ---
@@ -73,8 +73,27 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Co
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
+    // Capture dependencies once in the layer scope; the service methods below use these closures,
+    // so each method's environment stays `never` (deps are not re-yielded per call).
+    const account = yield* Account.Service
+    const wallet = yield* Wallet.Service
+
+    // Account lookup is best-effort: any AccountError (no account configured, DB unavailable) means
+    // there is no resolvable user id. Recover to undefined rather than failing the session.
+    const resolveUserID = Effect.fnUntraced(function* () {
+      const opt = yield* account.active().pipe(
+        Effect.catch(() => Effect.succeed(Option.none<Account.Info>())),
+      )
+      return Option.isSome(opt) ? opt.value.id : undefined
+    })
+
     return Service.of({
-      maybeShowAd: Effect.fn("CodeFree.maybeShowAd")(function* (sessionID, messageID, slotType, publishPart) {
+      maybeShowAd: Effect.fn("CodeFree.maybeShowAd")(function* (
+        sessionID: SessionID,
+        messageID: SessionV1.MessageID,
+        slotType: AdSlotType,
+        publishPart: (part: SessionV1.TextPart) => Effect.Effect<SessionV1.TextPart>,
+      ) {
         const adConfig = AdConfig.defaults
 
         // Ads must be enabled — skip entirely if disabled
@@ -116,27 +135,27 @@ export const layer = Layer.effect(
         recordImpression(impression)
 
         if (userID) {
-          yield* Wallet.Service.pipe(
-            Effect.flatMap((svc) =>
-              svc.creditWallet(
-                userID,
-                AD_VIEW_CREDIT_REWARD,
-                "ad_view",
-                `Ad view credit: ${ad.headline}`,
-                impression.id,
+          // Fire-and-forget the credit: a wallet failure is logged but never breaks the session.
+          yield* wallet
+            .creditWallet(
+              userID,
+              AD_VIEW_CREDIT_REWARD,
+              "ad_view",
+              `Ad view credit: ${ad.headline}`,
+              impression.id,
+            )
+            .pipe(
+              Effect.catch((err) =>
+                Effect.logWarning("CodeFree: failed to credit wallet for ad view", err),
               ),
-            ),
-            Effect.catchAll((err) =>
-              Effect.logWarning("CodeFree: failed to credit wallet for ad view", err),
-            ),
-          )
+            )
         }
 
         lastAdTimes[sessionID] = Date.now()
         incrementAdCount(sessionID)
       }),
 
-      applyUsage: Effect.fn("CodeFree.applyUsage")(function* (sessionID, costUSD) {
+      applyUsage: Effect.fn("CodeFree.applyUsage")(function* (sessionID: SessionID, costUSD: number) {
         if (costUSD <= 0) return 0
 
         const creditsNeeded = Wallet.usdToCredits(costUSD)
@@ -145,25 +164,57 @@ export const layer = Layer.effect(
         // If no account, user pays full price
         if (!userID) return costUSD
 
-        const svc = yield* Wallet.Service
+        // Try to debit — if insufficient balance, InsufficientBalanceError is thrown (the processor
+        // wraps this call so a failure never breaks the session).
+        yield* wallet.debitWallet(userID, creditsNeeded, `API usage for session ${sessionID}`, sessionID)
 
-        // Try to debit — if insufficient balance, InsufficientBalanceError is thrown
-        const result = yield* svc.debitWallet(
-          userID,
-          creditsNeeded,
-          `API usage for session ${sessionID}`,
-          sessionID,
-        )
-
-        // Calculate how much was actually covered
-        // If debit succeeded, wallet covered the full amount
-        // The debitWallet only succeeds if balance >= amount
+        // If debit succeeded, the wallet covered the full amount.
         return 0
       }),
     })
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(Wallet.defaultLayer), Layer.provide(Account.defaultLayer))
+// The CodeFree dependency layer provides every service the codefree feature needs at runtime:
+// Wallet (SQLite credit ledger), Config (real opencode.json codefree block), Account (user id
+// resolution), and EventV2 (ephemeral ad/credit events) via EventV2Bridge. Provided into the
+// SessionProcessor layer so `yield* CodeFree.maybeShowAd(...)` / `applyUsage(...)` resolve.
+export const defaultLayer = Layer.suspend(() =>
+  layer.pipe(
+    Layer.provide(Wallet.defaultLayer),
+    Layer.provide(Account.defaultLayer),
+    Layer.provide(Config.defaultLayer),
+    Layer.provide(EventV2Bridge.defaultLayer),
+  ),
+)
 
-export * as CodeFree from "."
+export const node = LayerNode.make(layer, [
+  Account.node,
+  // Wallet lives in core and has no LayerNode of its own; it only needs the shared Database node.
+  LayerNode.make(Wallet.layer, [Database.node]),
+  Config.node,
+  EventV2Bridge.node,
+])
+
+// --- Namespace accessors (callable Effects backed by CodeFree.Service) ---
+//
+// processor.ts calls `yield* CodeFree.maybeShowAd(...)` / `yield* CodeFree.applyUsage(...)`. These
+// accessors yield the Service from the context and delegate, so the call-sites resolve to the real
+// implementation (not undefined) as long as the SessionProcessor layer provides CodeFree.Service.
+
+export const maybeShowAd = Effect.fn("CodeFree.maybeShowAd")(function* (
+  sessionID: SessionID,
+  messageID: SessionV1.MessageID,
+  slotType: AdSlotType,
+  publishPart: (part: SessionV1.TextPart) => Effect.Effect<SessionV1.TextPart>,
+) {
+  const svc = yield* Service
+  yield* svc.maybeShowAd(sessionID, messageID, slotType, publishPart)
+})
+
+export const applyUsage = Effect.fn("CodeFree.applyUsage")(function* (sessionID: SessionID, costUSD: number) {
+  const svc = yield* Service
+  return yield* svc.applyUsage(sessionID, costUSD)
+})
+
+export * as CodeFree from "./codefree"

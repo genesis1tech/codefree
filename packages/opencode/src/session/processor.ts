@@ -428,7 +428,7 @@ export const layer = Layer.effect(
             yield* CodeFree.maybeShowAd(ctx.sessionID, ctx.assistantMessage.id, "thinking", (part) =>
               session.updatePart({ ...part, type: "text" }),
             ).pipe(
-              Effect.catchAll((err) =>
+              Effect.catch((err) =>
                 Effect.logWarning("CodeFree: ad injection skipped", err),
               ),
               Effect.forkIn(scope),
@@ -564,7 +564,7 @@ export const layer = Layer.effect(
             yield* CodeFree.maybeShowAd(ctx.sessionID, ctx.assistantMessage.id, "toolgap", (part) =>
               session.updatePart({ ...part, type: "text" }),
             ).pipe(
-              Effect.catchAll((err) =>
+              Effect.catch((err) =>
                 Effect.logWarning("CodeFree: toolgap ad injection skipped", err),
               ),
               Effect.forkIn(scope),
@@ -740,10 +740,12 @@ export const layer = Layer.effect(
             // Returns the portion NOT covered by credits (0 = fully covered).
             // Wrapped so wallet failure never breaks the session.
             const costCovered = yield* CodeFree.applyUsage(ctx.sessionID, usage.cost).pipe(
-              Effect.catchAll((err) => {
-                Effect.logWarning("CodeFree: usage deduction skipped", err)
-                return Effect.succeed(usage.cost)
-              }),
+              Effect.catch((err) =>
+                Effect.gen(function* () {
+                  yield* Effect.logWarning("CodeFree: usage deduction skipped", err)
+                  return usage.cost
+                }),
+              ),
             )
             ctx.assistantMessage.costCoveredByCredits = usage.cost - costCovered
             yield* session.updatePart({
@@ -1092,6 +1094,7 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(RuntimeFlags.defaultLayer),
     Layer.provide(Database.defaultLayer),
     Layer.provide(EventV2Bridge.defaultLayer),
+    Layer.provide(CodeFree.defaultLayer),
   ),
 )
 
@@ -1109,6 +1112,7 @@ export const node = LayerNode.make(layer, [
   EventV2Bridge.node,
   RuntimeFlags.node,
   Database.node,
+  CodeFree.node,
 ])
 
 export * as SessionProcessor from "./processor"
