@@ -31,6 +31,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ToolOutput, Usage, type LLMEvent } from "@opencode-ai/llm"
+import { CodeFree } from "@/session/codefree"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -422,6 +423,16 @@ export const layer = Layer.effect(
               ctx.reasoningMap[value.id].metadata = value.providerMetadata
             }
             yield* finishReasoning(value.id)
+            // CodeFree: maybe show an ad when extended thinking finishes.
+            // Fire-and-forget — never blocks the actual coding session.
+            yield* CodeFree.maybeShowAd(ctx.sessionID, ctx.assistantMessage.id, "thinking", (part) =>
+              session.updatePart({ ...part, type: "text" }),
+            ).pipe(
+              Effect.catchAll((err) =>
+                Effect.logWarning("CodeFree: ad injection skipped", err),
+              ),
+              Effect.forkIn(scope),
+            )
             return
 
           case "tool-input-start":
@@ -549,6 +560,15 @@ export const layer = Layer.effect(
           case "tool-result": {
             const toolCall = yield* readToolCall(value.id)
             if (!toolCall && value.result.type === "error") return
+            // CodeFree: tool-gap ad slot — between tool execution and next call.
+            yield* CodeFree.maybeShowAd(ctx.sessionID, ctx.assistantMessage.id, "toolgap", (part) =>
+              session.updatePart({ ...part, type: "text" }),
+            ).pipe(
+              Effect.catchAll((err) =>
+                Effect.logWarning("CodeFree: toolgap ad injection skipped", err),
+              ),
+              Effect.forkIn(scope),
+            )
             if (value.result.type === "error") {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (mirrorAssistant) {
@@ -716,6 +736,16 @@ export const layer = Layer.effect(
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
+            // CodeFree: try to cover the API cost with ad earnings.
+            // Returns the portion NOT covered by credits (0 = fully covered).
+            // Wrapped so wallet failure never breaks the session.
+            const costCovered = yield* CodeFree.applyUsage(ctx.sessionID, usage.cost).pipe(
+              Effect.catchAll((err) => {
+                Effect.logWarning("CodeFree: usage deduction skipped", err)
+                return Effect.succeed(usage.cost)
+              }),
+            )
+            ctx.assistantMessage.costCoveredByCredits = usage.cost - costCovered
             yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.reason,

@@ -1,0 +1,10 @@
+{
+  "name": "@opencode-ai/server",
+  "version": "0.0.0-stub",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./*": "./*.ts",
+    "./middleware/*": "./middleware/*.ts"
+  }
+}

@@ -20,8 +20,10 @@ import { mkdir, writeFile } from "node:fs/promises"
 import { useRoute, useRouteData } from "../../context/route"
 import { useProject } from "../../context/project"
 import { useSync } from "../../context/sync"
+import { useWallet } from "../../context/wallet"
 import { useEvent } from "../../context/event"
 import { SplitBorder } from "../../ui/border"
+import { AdBanner, type AdData, type AdPlacement } from "../../ui/ad-banner"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
@@ -52,6 +54,7 @@ import type { PromptInfo } from "../../component/prompt/history"
 import { DialogConfirm } from "../../ui/dialog-confirm"
 import { DialogTimeline } from "./dialog-timeline"
 import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
+import { DialogAds } from "./dialog-ads"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
@@ -551,6 +554,17 @@ export function Session() {
             sessionID={route.sessionID}
           />
         ))
+      },
+    },
+    {
+      title: "Ad preferences & wallet",
+      value: "codefree.ads",
+      category: "CodeFree",
+      slash: {
+        name: "ads",
+      },
+      run: () => {
+        dialog.replace(() => <DialogAds />)
       },
     },
     {

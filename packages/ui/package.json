@@ -1,0 +1,9 @@
+{
+  "name": "@opencode-ai/ui",
+  "version": "1.4.3",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./*": "./*"
+  }
+}
