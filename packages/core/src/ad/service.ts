@@ -1,11 +1,11 @@
-import { AdCreative, AdConfig, AdImpression, CREDITS_PER_CLICK, CREDITS_PER_VIEW, ImpressionStats } from "./types"
+import { AdCreative, AdCreativeID, AdvertiserID, AdConfig, AdImpression, CREDITS_PER_CLICK, CREDITS_PER_VIEW, ImpressionStats } from "./types"
 
 // -- Phase 0 placeholder ads --
 
 const PLACEHOLDER_ADS: ReadonlyArray<AdCreative> = [
   new AdCreative({
-    id: "ad-vercel-001",
-    advertiser_id: "vercel",
+    id: AdCreativeID.make("ad-vercel-001"),
+    advertiser_id: AdvertiserID.make("vercel"),
     headline: "Ship faster with Vercel",
     body: "Zero-config deploys, edge functions, and instant previews. From localhost to production in seconds.",
     cta_text: "Start deploying free",
@@ -15,8 +15,8 @@ const PLACEHOLDER_ADS: ReadonlyArray<AdCreative> = [
     format: "markdown",
   }),
   new AdCreative({
-    id: "ad-supabase-001",
-    advertiser_id: "supabase",
+    id: AdCreativeID.make("ad-supabase-001"),
+    advertiser_id: AdvertiserID.make("supabase"),
     headline: "Supabase — Open Source Firebase Alternative",
     body: "Postgres database, auth, storage, and real-time subscriptions. Build in a weekend, scale to millions.",
     cta_text: "Get started free",
@@ -26,8 +26,8 @@ const PLACEHOLDER_ADS: ReadonlyArray<AdCreative> = [
     format: "markdown",
   }),
   new AdCreative({
-    id: "ad-railway-001",
-    advertiser_id: "railway",
+    id: AdCreativeID.make("ad-railway-001"),
+    advertiser_id: AdvertiserID.make("railway"),
     headline: "Railway — Deploy anything",
     body: "Infrastructure made simple. Spin up databases, deploy apps, and scale effortlessly. No YAML required.",
     cta_text: "Try Railway free",
@@ -37,8 +37,8 @@ const PLACEHOLDER_ADS: ReadonlyArray<AdCreative> = [
     format: "markdown",
   }),
   new AdCreative({
-    id: "ad-planetscale-001",
-    advertiser_id: "planetscale",
+    id: AdCreativeID.make("ad-planetscale-001"),
+    advertiser_id: AdvertiserID.make("planetscale"),
     headline: "PlanetScale — Serverless MySQL",
     body: "Branch your database like your code. Non-blocking schema changes, built-in connection pooling, and zero-downtime.",
     cta_text: "Start free tier",
@@ -48,8 +48,8 @@ const PLACEHOLDER_ADS: ReadonlyArray<AdCreative> = [
     format: "markdown",
   }),
   new AdCreative({
-    id: "ad-neon-001",
-    advertiser_id: "neon",
+    id: AdCreativeID.make("ad-neon-001"),
+    advertiser_id: AdvertiserID.make("neon"),
     headline: "Neon — Serverless Postgres",
     body: "Branching, auto-scaling, and bottomless storage. The developer-friendly Postgres built for modern apps.",
     cta_text: "Create free database",
@@ -59,8 +59,8 @@ const PLACEHOLDER_ADS: ReadonlyArray<AdCreative> = [
     format: "markdown",
   }),
   new AdCreative({
-    id: "ad-convex-001",
-    advertiser_id: "convex",
+    id: AdCreativeID.make("ad-convex-001"),
+    advertiser_id: AdvertiserID.make("convex"),
     headline: "Convex — The Backend Platform",
     body: "Reactive queries, serverless functions, file storage, and real-time sync. Build full-stack apps without backend plumbing.",
     cta_text: "Start building",

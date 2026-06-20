@@ -2,18 +2,26 @@ import { Schema } from "effect"
 
 // -- ID types --
 
-const AdCreativeID = Schema.String.pipe(Schema.brand("AdCreativeID"))
-const AdSlotID = Schema.String.pipe(Schema.brand("AdSlotID"))
-const AdImpressionID = Schema.String.pipe(Schema.brand("AdImpressionID"))
-const AdvertiserID = Schema.String.pipe(Schema.brand("AdvertiserID"))
+export const AdCreativeID = Schema.String.pipe(Schema.brand("AdCreativeID"))
+export type AdCreativeID = typeof AdCreativeID.Type
+export const AdSlotID = Schema.String.pipe(Schema.brand("AdSlotID"))
+export type AdSlotID = typeof AdSlotID.Type
+export const AdImpressionID = Schema.String.pipe(Schema.brand("AdImpressionID"))
+export type AdImpressionID = typeof AdImpressionID.Type
+export const AdvertiserID = Schema.String.pipe(Schema.brand("AdvertiserID"))
+export type AdvertiserID = typeof AdvertiserID.Type
 
 // -- Enums --
 
-const AdCategory = Schema.Literal("devtool", "saas", "recruiting", "education", "affiliate")
+export const AdCategory = Schema.Literals(["devtool", "saas", "recruiting", "education", "affiliate"])
+export type AdCategory = typeof AdCategory.Type
 type AdCategoryType = typeof AdCategory.Type
-const AdFormat = Schema.Literal("text", "markdown")
-const SlotType = Schema.Literal("thinking", "toolgap", "idle")
-const SlotPosition = Schema.Literal("top", "bottom", "inline")
+export const AdFormat = Schema.Literals(["text", "markdown"])
+export type AdFormat = typeof AdFormat.Type
+export const SlotType = Schema.Literals(["thinking", "toolgap", "idle"])
+export type SlotType = typeof SlotType.Type
+export const SlotPosition = Schema.Literals(["top", "bottom", "inline"])
+export type SlotPosition = typeof SlotPosition.Type
 
 // -- Core types --
 

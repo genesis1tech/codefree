@@ -1,4 +1,4 @@
-import { AdCreative, AdConfig, AdImpression } from "./types"
+import { AdCreative, AdConfig, AdImpression, AdImpressionID } from "./types"
 
 type AdSlotType = "thinking" | "toolgap" | "idle"
 
@@ -79,7 +79,7 @@ export function trackImpression(
   advertiserCounts[ad.advertiser_id] = (advertiserCounts[ad.advertiser_id] ?? 0) + 1
 
   return new AdImpression({
-    id: crypto.randomUUID(),
+    id: AdImpressionID.make(crypto.randomUUID()),
     ad_id: ad.id,
     slot_type: slotType,
     session_id: sessionId,
