@@ -1,52 +1,169 @@
 import { describe, expect, it } from "bun:test"
-import { Effect, Layer, Option } from "effect"
+import path from "path"
+import os from "os"
+import { mkdtempSync } from "node:fs"
+import { Effect, Layer, Option, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { Wallet } from "@opencode-ai/core/wallet"
 import { EventV2 } from "@opencode-ai/core/event"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { ConfigCodefree } from "@opencode-ai/core/config/codefree"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { Global } from "@opencode-ai/core/global"
+import { getImpressionStats } from "@opencode-ai/core/ad/service"
 import { Config } from "@/config/config"
 import { Account } from "@/account/account"
 import { CodeFree } from "@/session/codefree"
+import { GlobalBus } from "@/bus/global"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { testEffect } from "./lib/effect"
 
 // A stable test user id resolved via the fake Account service (active remote account path).
 const TEST_USER_ID = "acct_codefree_test"
+const REMOTE_USER_ID = "acct_codefree_remote"
 
-// --- Test layer: CodeFree.layer wired with real Wallet + EventV2 (which only need a Database)
-// --- and fake Account + Config services. Only an in-memory Database is supplied externally,
-// --- proving the CodeFree layer provides the Wallet/Config/Account/EventV2 deps (VAL-SESSION-037).
+// Shared in-memory database layer source. Each test builds its own layer tree from it, so every
+// test starts with a fresh :memory: SQLite connection (no cross-test wallet/event leakage).
 const database = Database.layerFromPath(":memory:")
 
-const fakeAccount = Layer.mock(Account.Service)({
-  active: () =>
-    Effect.succeed(
-      Option.some(
-        new Account.Info({
-          id: Account.AccountID.make(TEST_USER_ID),
-          email: "codefree@test.local",
-          url: "https://codefree.test",
-          active_org_id: null,
-        }),
+// Fresh temp data dir for the stable local user id persistence. Created once per test file run so
+// stability-across-runs tests can read the same dir from independent layer constructions.
+const localIdDir = mkdtempSync(path.join(os.tmpdir(), "cf-local-id-"))
+const LOCAL_ID_FILE = path.join(localIdDir, "codefree_local_user_id")
+
+// --- Config helpers ---
+//
+// Build a ConfigV1.Info whose `codefree` block drives the real config read in maybeShowAd. The
+// base is decoded from an empty object (all ConfigV1 fields optional) and the codefree block is
+// overlaid. This proves maybeShowAd reads the REAL config, not hardcoded AdConfig.defaults.
+
+function configInfo(codefree?: ConfigCodefree.Info) {
+  // Decode an empty config (all ConfigV1 fields optional) and cast to the DeepMutable Info type so
+  // the codefree block overlays cleanly onto the runtime config shape.
+  const base = Schema.decodeUnknownSync(ConfigV1.Info)({}) as ConfigV1.Info
+  return { ...base, codefree }
+}
+
+function configLayer(codefree: ConfigCodefree.Info) {
+  // Cast to the Interface's declared get() return type: the decoded+overlaid object is structurally
+  // a valid ConfigV1.Info, but the opencode Info intersection (DeepMutable + plugin_origins?) makes
+  // direct inference fiddly for Layer.mock, so assert the exact expected Effect shape.
+  return Layer.mock(Config.Service)({
+    get: () => Effect.succeed(configInfo(codefree)) as ReturnType<Config.Interface["get"]>,
+  })
+}
+
+const enabledConfig = configLayer(new ConfigCodefree.Info({ enabled: true, min_interval_ms: 0, frequency_cap: 1000 }))
+const disabledConfig = configLayer(new ConfigCodefree.Info({ enabled: false }))
+
+// --- Account fakes ---
+
+function accountLayer(id: string) {
+  return Layer.mock(Account.Service)({
+    active: () =>
+      Effect.succeed(
+        Option.some(
+          new Account.Info({
+            id: Account.AccountID.make(id),
+            email: `${id}@test.local`,
+            url: "https://codefree.test",
+            active_org_id: null,
+          }),
+        ),
       ),
-    ),
+  })
+}
+
+const activeAccount = accountLayer(TEST_USER_ID)
+const remoteAccount = accountLayer(REMOTE_USER_ID)
+const noAccount = Layer.mock(Account.Service)({
+  active: () => Effect.succeed(Option.none()),
 })
 
-// Config is not yet consumed by the Phase 0 service body, but the layer must still PROVIDE it so
-// downstream/future codefree features can read the real config. Yielding the tag succeeds without
-// invoking any method.
-const fakeConfig = Layer.mock(Config.Service)({})
+// --- Layer builder ---
+//
+// Wires CodeFree.layer with real Wallet + EventV2Bridge (so events reach the GlobalBus) plus the
+// scenario-specific Account/Config/Global deps. Only an in-memory Database is supplied externally,
+// proving CodeFree provides the Wallet/Config/Account/EventV2/Global deps (VAL-SESSION-037).
+function buildLayer(opts: {
+  account: Layer.Layer<Account.Service>
+  config: Layer.Layer<Config.Service>
+  global?: Layer.Layer<Global.Service>
+  wallet?: Layer.Layer<Wallet.Service>
+}) {
+  const globalLayer = opts.global ?? Global.layerWith({ data: localIdDir })
+  const eventBridge = EventV2Bridge.layer.pipe(Layer.provide(EventV2.layer))
+  const walletLayer = opts.wallet ?? Wallet.layer
+  const sharedDeps = Layer.mergeAll(walletLayer, eventBridge, opts.account, opts.config, globalLayer).pipe(
+    Layer.provide(database),
+  )
+  const codefreeWithDeps = CodeFree.layer.pipe(Layer.provide(sharedDeps))
+  return Layer.mergeAll(codefreeWithDeps, sharedDeps)
+}
 
-// Shared dependency layer (Database-provided). Built once, then both fed to CodeFree.layer (so the
-// service resolves Wallet/Account/Config/EventV2) AND merged into the test environment so the tests
-// can assert against the very same Wallet/Account instances (Effect memoizes the shared layer).
-const sharedDeps = Layer.mergeAll(Wallet.layer, EventV2.layer, fakeAccount, fakeConfig).pipe(Layer.provide(database))
+// A publishPart stub that records every published part.
+function recordingPublisher(published: SessionV1.TextPart[]) {
+  return (part: SessionV1.TextPart) =>
+    Effect.sync(() => {
+      published.push(part)
+      return part
+    })
+}
 
-const codefreeLayer = Layer.mergeAll(CodeFree.layer.pipe(Layer.provide(sharedDeps)), sharedDeps)
+// Collect codefree.* events off the GlobalBus around an effect. Publish->bridge->bus is
+// synchronous within the publish Effect, so events are present once `run` completes. Generic over
+// the run effect's environment so the Service requirement carried by the namespace accessors flows
+// through to the test layer.
+function collectCodefreeEvents<R>(run: Effect.Effect<void, never, R>) {
+  return Effect.gen(function* () {
+    const seen: Array<{ type: string; properties: Record<string, unknown> }> = []
+    const handler = (evt: { payload?: { type?: string; properties?: Record<string, unknown> } }) => {
+      const type = evt.payload?.type
+      if (typeof type === "string" && type.startsWith("codefree.")) {
+        seen.push({ type, properties: evt.payload!.properties! })
+      }
+    }
+    GlobalBus.on("event", handler)
+    yield* run
+    GlobalBus.off("event", handler)
+    return seen
+  })
+}
 
-const eff = testEffect(codefreeLayer)
+// --- Scenario runners (one testEffect per distinct layer configuration) ---
 
-// --- VAL-SESSION-043: the namespace barrel resolves to the real service file ---
+const effEnabled = testEffect(buildLayer({ account: activeAccount, config: enabledConfig }))
+const effDisabled = testEffect(buildLayer({ account: activeAccount, config: disabledConfig }))
+const effLocal = testEffect(buildLayer({ account: noAccount, config: enabledConfig }))
+const effRemote = testEffect(buildLayer({ account: remoteAccount, config: enabledConfig }))
+const effGated = testEffect(
+  buildLayer({ account: activeAccount, config: configLayer(new ConfigCodefree.Info({ enabled: true, min_interval_ms: 60_000, max_ads_per_hour: 25, frequency_cap: 1000 })) }),
+)
+const effCapped = testEffect(
+  buildLayer({ account: activeAccount, config: configLayer(new ConfigCodefree.Info({ enabled: true, min_interval_ms: 0, max_ads_per_hour: 2, frequency_cap: 1000 })) }),
+)
+const effIsolated = testEffect(
+  buildLayer({ account: activeAccount, config: configLayer(new ConfigCodefree.Info({ enabled: true, min_interval_ms: 0, max_ads_per_hour: 1, frequency_cap: 1000 })) }),
+)
+const effMerged = testEffect(
+  buildLayer({ account: activeAccount, config: configLayer(new ConfigCodefree.Info({ enabled: true, max_ads_per_hour: 1, frequency_cap: 1000 })) }),
+)
+const effNoAd = testEffect(
+  buildLayer({ account: activeAccount, config: configLayer(new ConfigCodefree.Info({ enabled: true, min_interval_ms: 0, frequency_cap: 0 })) }),
+)
+const failingWallet = Layer.mock(Wallet.Service)({
+  creditWallet: () => Effect.fail(new Wallet.WalletNotFoundError({ userId: "boom" })),
+})
+const effFailing = testEffect(buildLayer({ account: activeAccount, config: enabledConfig, wallet: failingWallet }))
+
+function sessionID(tag: string) {
+  return SessionV2.ID.make(`sess_${tag}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`)
+}
+
+// =====================================================================================
+// VAL-SESSION-043: the namespace barrel resolves to the real service file
+// =====================================================================================
 
 describe("CodeFree namespace barrel (VAL-SESSION-043)", () => {
   it("exposes maybeShowAd as a callable function, not undefined", () => {
@@ -67,57 +184,42 @@ describe("CodeFree namespace barrel (VAL-SESSION-043)", () => {
   })
 })
 
-// --- VAL-SESSION-036: namespace accessors resolve to the real Service (not undefined) ---
+// =====================================================================================
+// VAL-SESSION-036: namespace accessors resolve to the real Service (not undefined)
+// =====================================================================================
 
 describe("CodeFree namespace accessors delegate to the Service (VAL-SESSION-036)", () => {
-  eff.effect("maybeShowAd accessor publishes one synthetic markdown text part via the Service", () =>
+  effEnabled.effect("maybeShowAd accessor publishes one synthetic markdown text part via the Service", () =>
     Effect.gen(function* () {
       const published: SessionV1.TextPart[] = []
-      const sessionID = SessionV2.ID.make(`sess_accessor_publish_${Date.now()}`)
-      const messageID = SessionV1.MessageID.make("msg_accessor_publish")
-
-      yield* CodeFree.maybeShowAd(sessionID, messageID, "toolgap", (part) =>
-        Effect.sync(() => {
-          published.push(part)
-          return part
-        }),
-      )
-
-      // The accessor resolved to the Service and executed — not a TypeError on undefined.
+      const sid = sessionID("acc_publish")
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_acc_publish"), "toolgap", recordingPublisher(published))
       expect(published.length).toBe(1)
       const part = published[0]
       expect(part.type).toBe("text")
       expect(part.synthetic).toBe(true)
       expect(part.text.length).toBeGreaterThan(0)
-      expect(part.sessionID).toBe(sessionID)
-      expect(part.messageID).toBe(messageID)
+      expect(part.sessionID).toBe(sid)
     }),
   )
 
-  eff.effect("maybeShowAd accessor credits the wallet +4 via the Service", () =>
+  effEnabled.effect("maybeShowAd accessor credits the wallet +4 via the Service", () =>
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
-      const sessionID = SessionV2.ID.make(`sess_accessor_credit_${Date.now()}`)
-
-      yield* CodeFree.maybeShowAd(sessionID, SessionV1.MessageID.make("msg_accessor_credit"), "toolgap", (part) => Effect.succeed(part))
-
+      const sid = sessionID("acc_credit")
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_acc_credit"), "toolgap", (p) => Effect.succeed(p))
       const balance = yield* wallet.getBalance(TEST_USER_ID)
       expect(balance.balanceCredits).toBe(4)
       expect(balance.lifetimeEarnedCredits).toBe(4)
     }),
   )
 
-  eff.effect("applyUsage accessor debits the wallet and returns 0 on full coverage via the Service", () =>
+  effEnabled.effect("applyUsage accessor debits the wallet and returns 0 on full coverage via the Service", () =>
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
-      const sessionID = SessionV2.ID.make(`sess_accessor_usage_${Date.now()}`)
-
-      // Seed 50 credits ($0.50); cost $0.20 = 20 credits is fully covered.
+      const sid = sessionID("acc_usage")
       yield* wallet.creditWallet(TEST_USER_ID, 50, "bonus", "seed for usage")
-
-      const uncovered = yield* CodeFree.applyUsage(sessionID, 0.2)
-
-      // Accessor delegated to the Service which debited the covered credits.
+      const uncovered = yield* CodeFree.applyUsage(sid, 0.2)
       expect(uncovered).toBe(0)
       const balance = yield* wallet.getBalance(TEST_USER_ID)
       expect(balance.balanceCredits).toBe(30)
@@ -126,55 +228,387 @@ describe("CodeFree namespace accessors delegate to the Service (VAL-SESSION-036)
   )
 })
 
-// --- VAL-SESSION-037: CodeFree layer provides Wallet/Config/Account/EventV2 deps
-// --- and maybeShowAd/applyUsage run with only an in-memory Database supplied externally ---
+// =====================================================================================
+// VAL-SESSION-037: CodeFree layer provides all deps with external Database
+// =====================================================================================
 
 describe("CodeFree layer provides all deps with external Database (VAL-SESSION-037)", () => {
-  eff.effect("Wallet/Config/Account/EventV2 + CodeFree.Service all resolve from the layer", () =>
+  effEnabled.effect("Wallet/Config/Account/EventV2 + CodeFree.Service all resolve from the layer", () =>
     Effect.gen(function* () {
       const codefree = yield* CodeFree.Service
       const wallet = yield* Wallet.Service
       const account = yield* Account.Service
       const config = yield* Config.Service
-      const events = yield* EventV2.Service
-
       expect(codefree).toBeDefined()
       expect(wallet).toBeDefined()
       expect(account).toBeDefined()
       expect(config).toBeDefined()
-      expect(events).toBeDefined()
-
-      // The active account resolves through the provided Account dep.
       const active = yield* account.active()
       expect(Option.isSome(active)).toBe(true)
     }),
   )
 
-  eff.effect("maybeShowAd runs end-to-end with only in-memory Database supplied externally", () =>
+  effEnabled.effect("maybeShowAd runs end-to-end with only in-memory Database supplied externally", () =>
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
-      const sessionID = SessionV2.ID.make(`sess_deps_maybe_${Date.now()}`)
-
-      yield* CodeFree.maybeShowAd(sessionID, SessionV1.MessageID.make("msg_deps_maybe"), "toolgap", (part) => Effect.succeed(part))
-
-      // Wallet dep worked: balance credited +4 through the provided Wallet.Service.
+      const sid = sessionID("deps_maybe")
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_deps_maybe"), "toolgap", (p) => Effect.succeed(p))
       const balance = yield* wallet.getBalance(TEST_USER_ID)
       expect(balance.balanceCredits).toBe(4)
     }),
   )
+})
 
-  eff.effect("applyUsage runs end-to-end with only in-memory Database supplied externally", () =>
+// =====================================================================================
+// VAL-SESSION-001/002/003/006: maybeShowAd happy path — publish, impression, credit, events
+// =====================================================================================
+
+describe("maybeShowAd happy path (VAL-SESSION-001/002/003/006)", () => {
+  effEnabled.effect("publishes exactly one synthetic markdown text part (VAL-SESSION-001)", () =>
+    Effect.gen(function* () {
+      const published: SessionV1.TextPart[] = []
+      const sid = sessionID("hp_publish")
+      const mid = SessionV1.MessageID.make("msg_hp_publish")
+      yield* CodeFree.maybeShowAd(sid, mid, "toolgap", recordingPublisher(published))
+      expect(published.length).toBe(1)
+      const part = published[0]
+      expect(part.type).toBe("text")
+      expect(part.synthetic).toBe(true)
+      expect(part.text.length).toBeGreaterThan(0)
+      expect(part.messageID).toBe(mid)
+      expect(part.sessionID).toBe(sid)
+    }),
+  )
+
+  effEnabled.effect("records an ad impression attributed to the resolved user and session (VAL-SESSION-002)", () =>
+    Effect.gen(function* () {
+      const sid = sessionID("hp_impression")
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_hp_imp"), "toolgap", (p) => Effect.succeed(p))
+      const stats = getImpressionStats(sid)
+      expect(stats.total_ads).toBe(1)
+    }),
+  )
+
+  effEnabled.effect("credits the wallet +4 with ad_view attribution (VAL-SESSION-003)", () =>
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
-      const sessionID = SessionV2.ID.make(`sess_deps_usage_${Date.now()}`)
-
-      yield* wallet.creditWallet(TEST_USER_ID, 50, "bonus", "seed")
-      const uncovered = yield* CodeFree.applyUsage(sessionID, 0.25)
-
-      // usdToCredits(0.25) = 25 credits; balance 50 fully covers it.
-      expect(uncovered).toBe(0)
+      const sid = sessionID("hp_credit")
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_hp_credit"), "toolgap", (p) => Effect.succeed(p))
       const balance = yield* wallet.getBalance(TEST_USER_ID)
-      expect(balance.balanceCredits).toBe(25)
+      expect(balance.balanceCredits).toBe(4)
+      const history = yield* wallet.getTransactionHistory(TEST_USER_ID)
+      const adView = history.find((t) => t.type === "ad_view")
+      expect(adView).toBeDefined()
+      expect(adView!.amountCredits).toBe(4)
+    }),
+  )
+
+  effEnabled.effect("emits both codefree events exactly once per ad (VAL-SESSION-006)", () =>
+    Effect.gen(function* () {
+      const sid = sessionID("hp_events")
+      const events = yield* collectCodefreeEvents(
+        CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_hp_events"), "toolgap", (p) => Effect.succeed(p)),
+      )
+      const impressions = events.filter((e) => e.type === "codefree.ad.impression")
+      const credits = events.filter((e) => e.type === "codefree.credit.updated")
+      expect(impressions.length).toBe(1)
+      expect(credits.length).toBe(1)
+    }),
+  )
+})
+
+// =====================================================================================
+// VAL-SESSION-026/027/028: event payload shapes + ephemeral (no sync)
+// =====================================================================================
+
+describe("event payloads and ephemerality (VAL-SESSION-026/027/028)", () => {
+  effEnabled.effect("codefree.ad.impression payload has amount=4, ad_id, slot_type, session_id (VAL-SESSION-026)", () =>
+    Effect.gen(function* () {
+      const sid = sessionID("shape_imp")
+      const events = yield* collectCodefreeEvents(
+        CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_shape_imp"), "toolgap", (p) => Effect.succeed(p)),
+      )
+      const imp = events.find((e) => e.type === "codefree.ad.impression")!
+      expect(imp.properties.amount).toBe(4)
+      expect(typeof imp.properties.ad_id).toBe("string")
+      expect(imp.properties.slot_type).toBe("toolgap")
+      expect(imp.properties.session_id).toBe(sid)
+    }),
+  )
+
+  effEnabled.effect("codefree.credit.updated payload has balance/earned/spent matching wallet (VAL-SESSION-027)", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const sid = sessionID("shape_cred")
+      const events = yield* collectCodefreeEvents(
+        CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_shape_cred"), "toolgap", (p) => Effect.succeed(p)),
+      )
+      const cred = events.find((e) => e.type === "codefree.credit.updated")!
+      const balance = yield* wallet.getBalance(TEST_USER_ID)
+      expect(cred.properties.balance_credits).toBe(balance.balanceCredits)
+      expect(cred.properties.lifetime_earned).toBe(balance.lifetimeEarnedCredits)
+      expect(cred.properties.lifetime_spent).toBe(balance.lifetimeSpentCredits)
+    }),
+  )
+
+  it("both codefree events are defined without sync (ephemeral, no durable rows) (VAL-SESSION-028)", () => {
+    expect(EventV2.registry.get("codefree.ad.impression")?.sync).toBeUndefined()
+    expect(EventV2.registry.get("codefree.credit.updated")?.sync).toBeUndefined()
+  })
+})
+
+// =====================================================================================
+// VAL-SESSION-040: events reach the GlobalBus via the EventV2 bridge
+// =====================================================================================
+
+describe("events reach the GlobalBus via the bridge (VAL-SESSION-040)", () => {
+  effEnabled.effect("a bus subscriber receives both event types with correct properties", () =>
+    Effect.gen(function* () {
+      const sid = sessionID("bus")
+      const events = yield* collectCodefreeEvents(
+        CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_bus"), "toolgap", (p) => Effect.succeed(p)),
+      )
+      const imp = events.find((e) => e.type === "codefree.ad.impression")
+      const cred = events.find((e) => e.type === "codefree.credit.updated")
+      expect(imp).toBeDefined()
+      expect(cred).toBeDefined()
+      expect(imp!.properties.amount).toBe(4)
+      expect(typeof cred!.properties.balance_credits).toBe("number")
+    }),
+  )
+})
+
+// =====================================================================================
+// VAL-SESSION-007/008: disabled config suppresses all side effects + real config drives behavior
+// =====================================================================================
+
+describe("real config drives behavior (VAL-SESSION-007/008)", () => {
+  effDisabled.effect("disabled config suppresses publish/impression/credit/events (VAL-SESSION-007)", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const published: SessionV1.TextPart[] = []
+      const sid = sessionID("disabled")
+      const events = yield* collectCodefreeEvents(
+        CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_disabled"), "toolgap", recordingPublisher(published)),
+      )
+      expect(published.length).toBe(0)
+      expect(getImpressionStats(sid).total_ads).toBe(0)
+      const balance = yield* wallet.getBalance(TEST_USER_ID).pipe(
+        Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
+      )
+      expect(balance?.balanceCredits ?? 0).toBe(0)
+      expect(events.length).toBe(0)
+    }),
+  )
+
+  effDisabled.effect("reads the REAL config: AdConfig.defaults.enabled is true but config suppresses ads (VAL-SESSION-008)", () =>
+    Effect.gen(function* () {
+      // The hardcoded AdConfig.defaults.enabled === true, yet the provided Config has enabled:false.
+      // Zero side effects proves the real Config.Service is consulted, not the hardcoded defaults.
+      const published: SessionV1.TextPart[] = []
+      const sid = sessionID("real_cfg")
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_real_cfg"), "toolgap", recordingPublisher(published))
+      expect(published.length).toBe(0)
+      expect(getImpressionStats(sid).total_ads).toBe(0)
+    }),
+  )
+})
+
+// =====================================================================================
+// VAL-SESSION-009/010/011/041: gating — interval, hourly cap, per-session isolation, config merge
+// =====================================================================================
+
+describe("gating honors the real config (VAL-SESSION-009/010/011/041)", () => {
+  effGated.live("min_interval_ms gating suppresses a back-to-back ad (VAL-SESSION-009)", () =>
+    Effect.gen(function* () {
+      const sid = sessionID("interval")
+      const published: SessionV1.TextPart[] = []
+      const pub = recordingPublisher(published)
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_i1"), "toolgap", pub)
+      expect(published.length).toBe(1)
+      // Second call immediately after — within min_interval_ms — is suppressed.
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_i2"), "toolgap", pub)
+      expect(published.length).toBe(1)
+    }),
+  )
+
+  effCapped.live("max_ads_per_hour cap suppresses ads beyond the limit (VAL-SESSION-010/041)", () =>
+    Effect.gen(function* () {
+      const sid = sessionID("cap")
+      const published: SessionV1.TextPart[] = []
+      const pub = recordingPublisher(published)
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_c1"), "toolgap", pub)
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_c2"), "toolgap", pub)
+      expect(published.length).toBe(2)
+      // Third eligible call within the same hour is suppressed by the cap.
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_c3"), "toolgap", pub)
+      expect(published.length).toBe(2)
+    }),
+  )
+
+  effIsolated.live("per-session gating is isolated across sessions (VAL-SESSION-011)", () =>
+    Effect.gen(function* () {
+      const sidA = sessionID("iso_a")
+      const sidB = sessionID("iso_b")
+      const pubA: SessionV1.TextPart[] = []
+      const pubB: SessionV1.TextPart[] = []
+      yield* CodeFree.maybeShowAd(sidA, SessionV1.MessageID.make("msg_ia1"), "toolgap", recordingPublisher(pubA))
+      // Session A hit its cap of 1 — second call suppressed.
+      yield* CodeFree.maybeShowAd(sidA, SessionV1.MessageID.make("msg_ia2"), "toolgap", recordingPublisher(pubA))
+      expect(pubA.length).toBe(1)
+      // Session B is independent — still eligible.
+      yield* CodeFree.maybeShowAd(sidB, SessionV1.MessageID.make("msg_ib1"), "toolgap", recordingPublisher(pubB))
+      expect(pubB.length).toBe(1)
+    }),
+  )
+
+  effMerged.live("partial user config merges over defaults (VAL-SESSION-041)", () =>
+    Effect.gen(function* () {
+      const sid = sessionID("merge")
+      const published: SessionV1.TextPart[] = []
+      const pub = recordingPublisher(published)
+      // First ad: default min_interval_ms (30000) is satisfied (lastAdTime 0).
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_m1"), "toolgap", pub)
+      expect(published.length).toBe(1)
+      // Second ad within default min_interval_ms (30000) is suppressed by the default interval.
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_m2"), "toolgap", pub)
+      expect(published.length).toBe(1)
+    }),
+  )
+})
+
+// =====================================================================================
+// VAL-SESSION-012/013/014: fire-and-forget, publishPart aborts, no eligible ad
+// =====================================================================================
+
+describe("fire-and-forget and abort semantics (VAL-SESSION-012/013/014)", () => {
+  effFailing.effect("wallet failure is swallowed — maybeShowAd still publishes and succeeds (VAL-SESSION-012)", () =>
+    Effect.gen(function* () {
+      const published: SessionV1.TextPart[] = []
+      const sid = sessionID("faf")
+      // The part is published; the wallet credit fails but is swallowed — no throw.
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_faf"), "toolgap", recordingPublisher(published))
+      expect(published.length).toBe(1)
+    }),
+  )
+
+  effEnabled.effect("publishPart failure aborts before credit/events and does not bump the cap (VAL-SESSION-013)", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const sid = sessionID("abort")
+      // publishPart is declared non-failing (Effect<TextPart>); the test injects a failure to prove
+      // maybeShowAd aborts before crediting/events. The assertion widens the error channel.
+      const failPublish: (part: SessionV1.TextPart) => Effect.Effect<SessionV1.TextPart> = () =>
+        Effect.fail(new Error("publish failed")) as unknown as Effect.Effect<SessionV1.TextPart>
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_abort"), "toolgap", failPublish).pipe(
+        Effect.catch(() => Effect.void),
+      )
+      // No credit, no impression.
+      const balance = yield* wallet.getBalance(TEST_USER_ID).pipe(
+        Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
+      )
+      expect(balance?.balanceCredits ?? 0).toBe(0)
+      expect(getImpressionStats(sid).total_ads).toBe(0)
+      // The failed ad did not count toward caps: a subsequent call with a working publish fires.
+      const published: SessionV1.TextPart[] = []
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_abort_ok"), "toolgap", recordingPublisher(published))
+      expect(published.length).toBe(1)
+    }),
+  )
+
+  effNoAd.effect("no eligible ad suppresses all side effects (VAL-SESSION-014)", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const published: SessionV1.TextPart[] = []
+      const sid = sessionID("noad")
+      const events = yield* collectCodefreeEvents(
+        CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_noad"), "toolgap", recordingPublisher(published)),
+      )
+      expect(published.length).toBe(0)
+      expect(getImpressionStats(sid).total_ads).toBe(0)
+      const balance = yield* wallet.getBalance(TEST_USER_ID).pipe(
+        Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
+      )
+      expect(balance?.balanceCredits ?? 0).toBe(0)
+      expect(events.length).toBe(0)
+    }),
+  )
+})
+
+// =====================================================================================
+// VAL-SESSION-022/023/024: stable local user id (no remote account)
+// =====================================================================================
+
+describe("stable local user id (VAL-SESSION-022/023/024)", () => {
+  effLocal.live("no remote account still credits +4 to a stable local wallet (VAL-SESSION-022)", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const sid = sessionID("local_credit")
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_local_credit"), "toolgap", (p) => Effect.succeed(p))
+      // The resolved stable local id is persisted in the global data dir.
+      const localId = yield* Effect.promise(() => Bun.file(LOCAL_ID_FILE).text())
+      expect(localId.startsWith("cfu_")).toBe(true)
+      const balance = yield* wallet.getBalance(localId)
+      expect(balance.balanceCredits).toBe(4)
+      expect(balance.lifetimeEarnedCredits).toBe(4)
+    }),
+  )
+
+  it("the stable local user id is reused across independent layer constructions (VAL-SESSION-023)", async () => {
+    const runOnce = () => {
+      const layer = buildLayer({ account: noAccount, config: enabledConfig, global: Global.layerWith({ data: localIdDir }) })
+      return Effect.runPromise(
+        Effect.gen(function* () {
+          yield* CodeFree.maybeShowAd(
+            sessionID("xrun"),
+            SessionV1.MessageID.make("msg_xrun"),
+            "toolgap",
+            (p) => Effect.succeed(p),
+          )
+        }).pipe(Effect.provide(layer)),
+      )
+    }
+    await runOnce()
+    const id1 = await Bun.file(LOCAL_ID_FILE).text()
+    await runOnce()
+    const id2 = await Bun.file(LOCAL_ID_FILE).text()
+    expect(id1).toBe(id2)
+    expect(id1.startsWith("cfu_")).toBe(true)
+  })
+
+  effLocal.live("applyUsage debits the same stable local wallet that maybeShowAd credited (VAL-SESSION-024)", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const sid = sessionID("local_usage")
+      // Earn 4 credits via an ad (credited to the stable local id).
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_lu"), "toolgap", (p) => Effect.succeed(p))
+      const localId = yield* Effect.promise(() => Bun.file(LOCAL_ID_FILE).text())
+      const before = yield* wallet.getBalance(localId)
+      expect(before.balanceCredits).toBe(4)
+      // applyUsage on a small cost ($0.01 = 1 credit) debits the same local wallet.
+      const uncovered = yield* CodeFree.applyUsage(sid, 0.01)
+      expect(uncovered).toBe(0)
+      const after = yield* wallet.getBalance(localId)
+      expect(after.balanceCredits).toBe(3)
+      expect(after.lifetimeSpentCredits).toBe(1)
+    }),
+  )
+})
+
+// =====================================================================================
+// VAL-SESSION-025: remote account id takes precedence over the local id
+// =====================================================================================
+
+describe("remote account precedence (VAL-SESSION-025)", () => {
+  effRemote.live("an active remote account is credited, not the local id (VAL-SESSION-025)", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const sid = sessionID("remote")
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_remote"), "toolgap", (p) => Effect.succeed(p))
+      // The remote account wallet is credited — the remote id takes precedence over the local id.
+      const balance = yield* wallet.getBalance(REMOTE_USER_ID)
+      expect(balance.balanceCredits).toBe(4)
+      expect(balance.lifetimeEarnedCredits).toBe(4)
     }),
   )
 })

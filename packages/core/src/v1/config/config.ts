@@ -3,6 +3,7 @@ export * as ConfigV1 from "./config"
 import { Schema } from "effect"
 import { NonNegativeInt, PositiveInt, type DeepMutable } from "../../schema"
 import { ConfigExperimental } from "../../config/experimental"
+import { ConfigCodefree } from "../../config/codefree"
 import { ConfigReference } from "../../config/reference"
 import { ConfigAgentV1 } from "./agent"
 import { ConfigAttachmentV1 } from "./attachment"
@@ -184,6 +185,11 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
+  // Ad-sponsored credit earning configuration. Optional so existing configs are unaffected; read
+  // by the CodeFree session integration and merged over ConfigCodefree.defaults at runtime.
+  codefree: Schema.optional(ConfigCodefree.Info).annotate({
+    description: "Ad-sponsored credit earning configuration (Phase 0)",
+  }),
 }).annotate({ identifier: "Config" })
 
 export type Info = DeepMutable<Schema.Schema.Type<typeof Info>>

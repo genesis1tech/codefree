@@ -471,6 +471,9 @@ export const Assistant = Schema.Struct({
   }),
   summary: Schema.optional(Schema.Boolean),
   cost: Schema.Finite,
+  // Portion of `cost` covered by ad-earned credits (applyUsage accounting). Optional so existing
+  // Assistant constructors that omit it still compile; absent stays absent (not coerced to 0).
+  costCoveredByCredits: Schema.optional(Schema.Finite),
   tokens: Schema.Struct({
     total: Schema.optional(Schema.Finite),
     input: Schema.Finite,
