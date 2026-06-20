@@ -85,7 +85,7 @@ export function formatCredits(credits: number): string {
 
 function rowToWalletInfo(row: typeof WalletTable.$inferSelect): WalletInfo {
   return new WalletInfo({
-    id: row.id,
+    id: ID.make(row.id),
     userId: row.user_id,
     balanceCredits: row.balance_credits,
     lifetimeEarnedCredits: row.lifetime_earned_credits,
@@ -97,9 +97,9 @@ function rowToWalletInfo(row: typeof WalletTable.$inferSelect): WalletInfo {
 
 function rowToTransactionInfo(row: typeof WalletTransactionTable.$inferSelect): TransactionInfo {
   return new TransactionInfo({
-    id: row.id,
-    walletId: row.wallet_id,
-    type: row.type,
+    id: TransactionID.make(row.id),
+    walletId: ID.make(row.wallet_id),
+    type: Schema.decodeUnknownSync(TransactionType)(row.type),
     amountCredits: row.amount_credits,
     description: row.description,
     referenceId: row.reference_id ?? undefined,
@@ -110,21 +110,21 @@ function rowToTransactionInfo(row: typeof WalletTransactionTable.$inferSelect): 
 // --- Service ---
 
 export interface Interface {
-  readonly getOrCreateWallet: (userId: string) => Effect.Effect<WalletInfo>
-  readonly getBalance: (userId: string) => Effect.Effect<WalletInfo>
+  readonly getOrCreateWallet: (userId: string) => Effect.Effect<WalletInfo, WalletNotFoundError>
+  readonly getBalance: (userId: string) => Effect.Effect<WalletInfo, WalletNotFoundError>
   readonly creditWallet: (
     userId: string,
     amount: number,
     type: TransactionType,
     description: string,
     referenceId?: string,
-  ) => Effect.Effect<WalletInfo>
+  ) => Effect.Effect<WalletInfo, WalletNotFoundError>
   readonly debitWallet: (
     userId: string,
     amount: number,
     description: string,
     referenceId?: string,
-  ) => Effect.Effect<WalletInfo>
+  ) => Effect.Effect<WalletInfo, WalletNotFoundError | InsufficientBalanceError>
   readonly getTransactionHistory: (
     userId: string,
     limit?: number,
@@ -223,28 +223,32 @@ export const layer = Layer.effect(
       }),
 
       debitWallet: Effect.fn("Wallet.debitWallet")(function* (userId, amount, description, referenceId) {
+        // Pre-check existence and balance outside the transaction so the tagged errors
+        // (WalletNotFoundError / InsufficientBalanceError) surface as typed failures
+        // catchable by callers, instead of being converted to defects by the transaction's
+        // Effect.orDie. The wallet balance is left untouched on rejection.
+        const existing = yield* findWalletByUser(userId)
+        if (!existing) return yield* new WalletNotFoundError({ userId })
+        if (existing.balance_credits < amount) {
+          return yield* new InsufficientBalanceError({ required: amount, available: existing.balance_credits })
+        }
         const transactionId = TransactionID.create()
         yield* db
           .transaction((tx) =>
             Effect.gen(function* () {
-              const row = yield* tx.select().from(WalletTable).where(eq(WalletTable.user_id, userId)).get()
-              if (!row) return yield* new WalletNotFoundError({ userId })
-              if (row.balance_credits < amount) {
-                return yield* new InsufficientBalanceError({ required: amount, available: row.balance_credits })
-              }
               yield* tx
                 .update(WalletTable)
                 .set({
                   balance_credits: sql`${WalletTable.balance_credits} - ${amount}`,
                   lifetime_spent_credits: sql`${WalletTable.lifetime_spent_credits} + ${amount}`,
                 })
-                .where(eq(WalletTable.id, row.id))
+                .where(eq(WalletTable.id, existing.id))
                 .run()
               yield* tx
                 .insert(WalletTransactionTable)
                 .values({
                   id: transactionId,
-                  wallet_id: row.id,
+                  wallet_id: existing.id,
                   type: "api_usage",
                   amount_credits: -amount,
                   description,

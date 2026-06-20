@@ -1,1 +1,1 @@
-export * as Wallet from "./wallet"
+export * as Wallet from "./wallet/index"
