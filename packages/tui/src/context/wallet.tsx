@@ -5,13 +5,15 @@ import { useKV } from "./kv"
 import { useEvent } from "./event"
 
 // Shared with the AdPreferences panel so the enable toggle and the wallet
-// agree on the persisted on/off state.
+// agree on the persisted on/off state. Both default to false (ads disabled)
+// on a fresh install.
 const KV_ADS_ENABLED = "codefree_ads_enabled"
 
-// Phase 0 MVP credit economics. Real per-impression / per-click values will
-// come from the ad server once the wallet HTTP endpoint ships.
-const IMPRESSION_CREDIT = 1
-const CLICK_CREDIT = 5
+// Standardized Phase 0 credit economics: 4 credits per ad view, 100 per
+// affiliate click, 1 credit = $0.01. These mirror the backend constants
+// (CREDITS_PER_VIEW / CREDITS_PER_CLICK) so the TUI and wallet agree.
+export const IMPRESSION_CREDIT = 4
+export const CLICK_CREDIT = 100
 
 // Wallet field names mirror the server wallet table columns (snake_case) so
 // they can be reconciled 1:1 with the API response without renaming.
@@ -39,10 +41,9 @@ export const { use: useWallet, provider: WalletProvider } = createSimpleContext(
       session_delta: 0,
       session_ads_seen: 0,
       session_clicks: 0,
-      // Phase 0 default: ads disabled. NOTE: the shipped AdPreferences panel
-      // defaults this same KV key to `true`, so on a fresh install (key unset)
-      // the two views disagree until the user toggles once. They stay in sync
-      // afterwards because both read/write `codefree_ads_enabled`.
+      // Phase 0 default: ads disabled. The AdPreferences panel reads the same
+      // KV key with the same false default, so both views agree on a fresh
+      // install and stay in sync after any user toggle.
       is_enabled: kv.get(KV_ADS_ENABLED, false),
     })
 

@@ -31,7 +31,7 @@ export function AdPreferences(props: AdPreferencesProps) {
   const { theme } = useTheme()
   const kv = useKV()
 
-  const [adsEnabled, setAdsEnabled] = createSignal(kv.get(KV_ADS_ENABLED, true))
+  const [adsEnabled, setAdsEnabled] = createSignal(kv.get(KV_ADS_ENABLED, false))
   const categories = () => (props.availableCategories ?? DEFAULT_CATEGORIES)
   const [allowedCategories, setAllowedCategories] = createSignal<string[]>(
     kv.get(KV_AD_CATEGORIES, categories()),
