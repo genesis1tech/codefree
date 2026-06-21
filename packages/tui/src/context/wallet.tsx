@@ -47,13 +47,20 @@ export const { use: useWallet, provider: WalletProvider } = createSimpleContext(
       is_enabled: kv.get(KV_ADS_ENABLED, false),
     })
 
-    // ---- Phase 0: local-only state, no server roundtrip. ----
-    // When the wallet endpoint lands, refresh() should fetch authoritative
-    // balances and reconcile the store, mirroring how sync.tsx bootstraps
-    // server data (sdk.client.experimental.wallet.get + reconcile).
-    async function refresh() {
-      // TODO(server): const result = await sdk.client.experimental.wallet.get(...)
-      // setStore(reconcile(result.data)). Left local-only for Phase 0.
+    // ---- Boot hydration ----
+    //
+    // The persisted wallet balance is reconciled from a boot-time codefree.credit.updated event
+    // emitted by the backend (CodeFree.hydrateWallet) when a session starts. The subscription
+    // below matches that event and overwrites balance_credits / lifetime_earned / lifetime_spent
+    // with the authoritative backend values, so a restart shows the persisted balance immediately
+    // (not 0) once the first session prompt fires (VAL-TUI-025 / VAL-CROSS-016).
+    //
+    // The is_enabled state is persisted in KV (codefree_ads_enabled) and read on boot above, so
+    // the WalletIndicator visibility survives restarts without any server roundtrip (VAL-TUI-024).
+    function refresh() {
+      // No-op: hydration is event-driven. The backend emits codefree.credit.updated on session
+      // start; the subscription handler reconciles the store. Kept as a stable API for callers
+      // that may trigger a manual refresh in the future.
       return
     }
 

@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test"
 import path from "path"
 import os from "os"
 import { mkdtempSync } from "node:fs"
-import { Effect, Layer, Option, Schema } from "effect"
+import { Effect, Exit, Layer, Option, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { Wallet } from "@opencode-ai/core/wallet"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -798,4 +798,77 @@ describe("Assistant schema costCoveredByCredits (VAL-SESSION-030)", () => {
     const decoded = Schema.decodeSync(SessionV1.Assistant)(encoded)
     expect(decoded.costCoveredByCredits).toBeUndefined()
   })
+})
+
+// =====================================================================================
+// VAL-TUI-025 / VAL-CROSS-016: boot hydration emits credit.updated with persisted balance
+// =====================================================================================
+//
+// hydrateWallet reads the resolved user's persisted wallet balance and emits a single
+// codefree.credit.updated event so the TUI footer reconciles to the persisted balance on
+// restart (not 0). This is the backend half of boot hydration; the TUI wallet store already
+// subscribes to codefree.credit.updated and reconciles balance_credits/lifetime_*.
+
+describe("CodeFree namespace exposes hydrateWallet (VAL-TUI-025)", () => {
+  it("exposes hydrateWallet as a callable function, not undefined", () => {
+    expect(CodeFree.hydrateWallet).toBeDefined()
+    expect(typeof CodeFree.hydrateWallet).toBe("function")
+  })
+})
+
+describe("CodeFree hydrateWallet emits credit.updated with the persisted balance (VAL-TUI-025 / VAL-CROSS-016)", () => {
+  effEnabled.effect("emits one credit.updated with a persisted positive balance", () =>
+    collectCodefreeEvents(
+      Effect.gen(function* () {
+        const wallet = yield* Wallet.Service
+        // Seed a persisted balance so hydration has something real to report.
+        yield* wallet.creditWallet(TEST_USER_ID, 8, "bonus", "seed before restart")
+        yield* CodeFree.hydrateWallet(sessionID("hydrate_pos"))
+      }),
+    ).pipe(
+      Effect.map((events) => {
+        const creditEvents = events.filter((e) => e.type === "codefree.credit.updated")
+        expect(creditEvents.length).toBe(1)
+        const props = creditEvents[0].properties as {
+          balance_credits: number
+          lifetime_earned: number
+          lifetime_spent: number
+        }
+        // The persisted balance (8 credits) is reflected, not 0.
+        expect(props.balance_credits).toBe(8)
+        expect(props.lifetime_earned).toBe(8)
+        expect(props.lifetime_spent).toBe(0)
+      }),
+    ),
+  )
+
+  effEnabled.effect("emits credit.updated with zeros for a fresh wallet (no prior activity)", () =>
+    collectCodefreeEvents(
+      Effect.gen(function* () {
+        yield* CodeFree.hydrateWallet(sessionID("hydrate_zero"))
+      }),
+    ).pipe(
+      Effect.map((events) => {
+        const creditEvents = events.filter((e) => e.type === "codefree.credit.updated")
+        expect(creditEvents.length).toBe(1)
+        const props = creditEvents[0].properties as { balance_credits: number }
+        expect(props.balance_credits).toBe(0)
+      }),
+    ),
+  )
+
+  effEnabled.effect("hydrateWallet never throws — failures are swallowed (non-breaking)", () =>
+    collectCodefreeEvents(
+      Effect.gen(function* () {
+        // hydrateWallet with a normal layer should always succeed (void) even if the wallet
+        // is empty. The processor calls it fire-and-forget so it must never break the session.
+        const result = yield* Effect.exit(CodeFree.hydrateWallet(sessionID("hydrate_safe")))
+        expect(Exit.isSuccess(result)).toBe(true)
+      }),
+    ).pipe(
+      Effect.map(() => {
+        // Exit already asserted above; this map ensures the effect runs to completion.
+      }),
+    ),
+  )
 })

@@ -115,6 +115,7 @@ const spyCodefree = Layer.succeed(
         }
         return spyApplyUsageUncovered
       }),
+    hydrateWallet: () => Effect.void,
   }),
 )
 

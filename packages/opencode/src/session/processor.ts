@@ -110,6 +110,16 @@ export const layer = Layer.effect(
     const codefree = yield* CodeFree.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
+      // CodeFree: hydrate the TUI wallet with the persisted balance on session start so the footer
+      // shows the real balance (not 0) after a restart (VAL-TUI-025 / VAL-CROSS-016). Fire-and-
+      // forget: the call is swallowed on failure (including defects) so it never blocks or breaks
+      // the session.
+      yield* codefree.hydrateWallet(input.sessionID).pipe(
+        Effect.catchDefect((defect) =>
+          Effect.logWarning("CodeFree: wallet hydration defect (non-breaking)", defect),
+        ),
+        Effect.catch((err) => Effect.logWarning("CodeFree: wallet hydration skipped", err)),
+      )
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
       // may execute tools internally before emitting start-step events,
       // so capturing inside the event handler can be too late.
@@ -429,6 +439,9 @@ export const layer = Layer.effect(
             yield* codefree.maybeShowAd(ctx.sessionID, ctx.assistantMessage.id, "thinking", (part) =>
               session.updatePart({ ...part, type: "text" }),
             ).pipe(
+              Effect.catchDefect((defect) =>
+                Effect.logWarning("CodeFree: ad injection defect (non-breaking)", defect),
+              ),
               Effect.catch((err) => Effect.logWarning("CodeFree: ad injection skipped", err)),
               Effect.forkIn(scope),
             )
@@ -564,6 +577,9 @@ export const layer = Layer.effect(
             yield* codefree.maybeShowAd(ctx.sessionID, ctx.assistantMessage.id, "toolgap", (part) =>
               session.updatePart({ ...part, type: "text" }),
             ).pipe(
+              Effect.catchDefect((defect) =>
+                Effect.logWarning("CodeFree: toolgap ad injection defect (non-breaking)", defect),
+              ),
               Effect.catch((err) => Effect.logWarning("CodeFree: toolgap ad injection skipped", err)),
               Effect.forkIn(scope),
             )
@@ -739,6 +755,12 @@ export const layer = Layer.effect(
             // full cost is treated as uncovered so costCoveredByCredits falls back to 0
             // (VAL-SESSION-021): a wallet failure never breaks the session.
             const uncovered = yield* codefree.applyUsage(ctx.sessionID, usage.cost).pipe(
+              Effect.catchDefect((defect) =>
+                Effect.gen(function* () {
+                  yield* Effect.logWarning("CodeFree: usage deduction defect (non-breaking)", defect)
+                  return usage.cost
+                }),
+              ),
               Effect.catch((err) =>
                 Effect.gen(function* () {
                   yield* Effect.logWarning("CodeFree: usage deduction skipped", err)

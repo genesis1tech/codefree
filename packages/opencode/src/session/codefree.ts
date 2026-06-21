@@ -89,6 +89,10 @@ export interface Interface {
     sessionID: SessionID,
     costUSD: number,
   ) => Effect.Effect<number, Wallet.WalletNotFoundError | Wallet.InsufficientBalanceError>
+  // Boot/session-start hydration: reads the resolved user's persisted wallet balance and emits a
+  // single codefree.credit.updated event so the TUI footer reconciles to the persisted balance on
+  // restart (not 0). Fire-and-forget from the processor — never breaks the session (VAL-TUI-025).
+  readonly hydrateWallet: (sessionID: SessionID) => Effect.Effect<void>
 }
 
 // --- Service ---
@@ -217,6 +221,9 @@ export const layer = Layer.effect(
             })
           }
         }).pipe(
+          Effect.catchDefect((defect) =>
+            Effect.logWarning("CodeFree: ad side-effects defect (non-breaking)", defect),
+          ),
           Effect.catch((err) =>
             Effect.logWarning("CodeFree: ad side-effects failed (impression/credit/event)", err),
           ),
@@ -261,10 +268,37 @@ export const layer = Layer.effect(
             })
           }
         }).pipe(
+          Effect.catchDefect((defect) =>
+            Effect.logWarning("CodeFree: credit.updated emit defect (non-breaking)", defect),
+          ),
           Effect.catch((err) => Effect.logWarning("CodeFree: credit.updated emit skipped", err)),
         )
 
         return uncovered
+      }),
+
+      hydrateWallet: Effect.fn("CodeFree.hydrateWallet")(function* (_sessionID: SessionID) {
+        // Resolve the user id (remote account or stable local id) and read the persisted wallet
+        // balance, then emit a single codefree.credit.updated so the TUI footer reconciles to the
+        // persisted balance on restart — not 0 (VAL-TUI-025 / VAL-CROSS-016). getOrCreateWallet
+        // auto-provisions a zeroed wallet for a fresh user so hydration always has a balance to
+        // report. Both typed errors and defects (e.g. SQLite "no such table" during migration
+        // races) are swallowed so the fire-and-forget call never breaks the session.
+        yield* Effect.gen(function* () {
+          const userID = yield* resolveUserID()
+          if (!userID) return
+          const info = yield* wallet.getOrCreateWallet(userID)
+          yield* events.publish(CreditUpdatedEvent, {
+            balance_credits: info.balanceCredits,
+            lifetime_earned: info.lifetimeEarnedCredits,
+            lifetime_spent: info.lifetimeSpentCredits,
+          })
+        }).pipe(
+          Effect.catchDefect((defect) =>
+            Effect.logWarning("CodeFree: wallet hydration defect (non-breaking)", defect),
+          ),
+          Effect.catch((err) => Effect.logWarning("CodeFree: wallet hydration failed", err)),
+        )
       }),
     })
   }),
@@ -313,6 +347,11 @@ export const maybeShowAd = Effect.fn("CodeFree.maybeShowAd")(function* (
 export const applyUsage = Effect.fn("CodeFree.applyUsage")(function* (sessionID: SessionID, costUSD: number) {
   const svc = yield* Service
   return yield* svc.applyUsage(sessionID, costUSD)
+})
+
+export const hydrateWallet = Effect.fn("CodeFree.hydrateWallet")(function* (sessionID: SessionID) {
+  const svc = yield* Service
+  yield* svc.hydrateWallet(sessionID)
 })
 
 export * as CodeFree from "./codefree"
