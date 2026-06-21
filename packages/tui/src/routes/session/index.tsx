@@ -21,6 +21,7 @@ import { useRoute, useRouteData } from "../../context/route"
 import { useProject } from "../../context/project"
 import { useSync } from "../../context/sync"
 import { useWallet } from "../../context/wallet"
+import { WalletIndicator } from "../../ui/wallet-indicator"
 import { useEvent } from "../../context/event"
 import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
@@ -187,6 +188,7 @@ export function Session() {
   const { navigate } = useRoute()
   const sync = useSync()
   const event = useEvent()
+  const wallet = useWallet()
   const project = useProject()
   const paths = useTuiPaths()
   const tuiConfig = useTuiConfig()
@@ -1329,7 +1331,14 @@ export function Session() {
                         toBottom()
                       }}
                       sessionID={route.sessionID}
-                      right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
+                      right={
+                        <>
+                          <Show when={wallet.balance > 0 || wallet.isEnabled}>
+                            <WalletIndicator wallet={{ credits: wallet.balance, sessionDelta: wallet.sessionDelta }} />
+                          </Show>
+                          <pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />
+                        </>
+                      }
                     />
                   </pluginRuntime.Slot>
                 </Show>

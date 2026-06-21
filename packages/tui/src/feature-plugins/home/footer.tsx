@@ -4,6 +4,8 @@ import { createMemo, Match, Show, Switch } from "solid-js"
 import { abbreviateHome } from "../../runtime"
 import { useTuiPaths } from "../../context/runtime"
 import { useHomeSessionDestination } from "../../routes/home/session-destination"
+import { useWallet } from "../../context/wallet"
+import { WalletIndicator } from "../../ui/wallet-indicator"
 
 const id = "internal:home-footer"
 
@@ -61,6 +63,15 @@ function Version(props: { api: TuiPluginApi }) {
   )
 }
 
+function Wallet() {
+  const wallet = useWallet()
+  return (
+    <Show when={wallet.balance > 0 || wallet.isEnabled}>
+      <WalletIndicator wallet={{ credits: wallet.balance, sessionDelta: wallet.sessionDelta }} />
+    </Show>
+  )
+}
+
 function View(props: { api: TuiPluginApi }) {
   return (
     <box
@@ -75,6 +86,7 @@ function View(props: { api: TuiPluginApi }) {
     >
       <Directory api={props.api} />
       <Mcp api={props.api} />
+      <Wallet />
       <box flexGrow={1} />
       <Version api={props.api} />
     </box>
