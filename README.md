@@ -20,19 +20,101 @@ CodeFree never touches your provider billing. You bring your own Anthropic (or o
 
 ## Quick Start
 
+CodeFree runs from source today using [Bun](https://bun.sh). A published `codefree`
+package is planned but not yet available.
+
 ```bash
-# Install
-npm install -g codefree
+# From the repo root
+bun install
 
-# Configure your API key
-codefree config set providers.anthropic.api.key sk-ant-...
+# Bring your own provider key (OpenAI is the validated provider)
+echo "OPENAI_API_KEY=sk-..." > .env
 
-# Enable ads (opt-in)
-# Add to opencode.json:
+# Enable ads (opt-in) by adding to opencode.json:
 # { "codefree": { "enabled": true } }
 
-# Start
-codefree
+# Launch the TUI from source
+bun run dev --model openai/gpt-4o
+```
+
+The eventual published install (not yet available) will be:
+
+```bash
+npm install -g codefree
+```
+
+See [Development](#development-run-from-source) and [Environment](#environment) for details.
+
+## Development (run from source)
+
+**Prerequisites**: [Bun](https://bun.sh) (the repo pins `bun@1.3.14`).
+
+Install all workspace dependencies from the repo root:
+
+```bash
+bun install
+```
+
+This is a Bun monorepo. The CodeFree-relevant packages are:
+
+- `packages/core` — ad engine (`ad/types`, `ad/service`, `ad/injector`), the local wallet module/service, and config-merge + `applyUsage` cost accounting.
+- `packages/opencode` — CLI/TUI host and session integration: the CodeFree service, `maybeShowAd` (config read, local user id, ad/credit events), `applyUsage` cost-offset, processor wiring, and wallet boot hydration.
+- `packages/tui` — terminal UI surfaces: the `WalletIndicator` footer, the `/ads` dialog, ad preferences, and the wallet context store.
+- `packages/server` — minimal stub package required so the TUI worker thread boots.
+
+Launch the TUI from source with the root `dev` script (which runs the `packages/opencode/src/index.ts` entrypoint via `bun run --cwd packages/opencode --conditions=browser src/index.ts`):
+
+```bash
+bun run dev
+
+# or pass a model directly
+bun run dev --model openai/gpt-4o
+```
+
+## Environment
+
+For end-to-end use you bring your own provider key (BYOK) — it stays local. The validated configuration in this project is **OpenAI**:
+
+```bash
+# repo-root .env
+OPENAI_API_KEY=sk-...
+```
+
+```bash
+bun run dev --model openai/gpt-4o
+```
+
+Other providers also work via opencode's normal provider configuration.
+
+To actually see ads and earn credits, opt in via `opencode.json` and run a tool-using prompt so that a tool gap occurs:
+
+```json
+{ "codefree": { "enabled": true, "min_interval_ms": 30000, "max_ads_per_hour": 25 } }
+```
+
+See [Configuration](#configuration) for the full list of fields. The local credit wallet persists under the opencode data dir, keyed by a stable local user id, so balances survive restarts with no login required.
+
+## Testing
+
+Run the CodeFree test suites with Bun:
+
+```bash
+# Core unit tests (ad engine, wallet, config)
+cd packages/core && bun test test/ad.test.ts test/wallet.test.ts test/codefree-config.test.ts
+
+# Session integration tests
+cd packages/opencode && bun test test/codefree.test.ts
+
+# Optional: TUI wallet store unit tests
+cd packages/tui && bun test test/wallet.test.ts
+```
+
+Typecheck per package:
+
+```bash
+cd packages/core && bunx tsc --noEmit
+cd packages/opencode && bunx tsc --noEmit
+cd packages/tui && bunx tsc --noEmit
 ```
 
 ## Configuration
