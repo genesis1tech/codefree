@@ -4,7 +4,9 @@
   "type": "module",
   "license": "MIT",
   "exports": {
-    "./*": "./*.ts",
-    "./middleware/*": "./middleware/*.ts"
+    "./*": "./*/index.ts"
+  },
+  "dependencies": {
+    "effect": "catalog:"
   }
 }
