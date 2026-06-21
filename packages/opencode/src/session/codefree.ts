@@ -144,21 +144,6 @@ export const layer = Layer.effect(
       return yield* resolveLocalUserID()
     })
 
-    // Publish the credit.updated event reflecting the wallet's current state. Best-effort: a
-    // failure is logged, never propagated (fire-and-forget).
-    const emitCreditUpdated = (userID: string) =>
-      Effect.gen(function* () {
-        const balance = yield* wallet.getBalance(userID).pipe(
-          Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
-        )
-        if (!balance) return
-        yield* events.publish(CreditUpdatedEvent, {
-          balance_credits: balance.balanceCredits,
-          lifetime_earned: balance.lifetimeEarnedCredits,
-          lifetime_spent: balance.lifetimeSpentCredits,
-        })
-      })
-
     return Service.of({
       maybeShowAd: Effect.fn("CodeFree.maybeShowAd")(function* (
         sessionID: SessionID,
@@ -250,14 +235,32 @@ export const layer = Layer.effect(
         // No resolvable user id (degenerate) => user pays the full cost (VAL-SESSION-039).
         if (!userID) return costUSD
 
+        // Snapshot lifetime_spent before the debit so we can detect whether a nonzero debit
+        // actually occurred (VAL-SESSION-020: emit credit.updated only after a debit).
+        const before = yield* wallet.getBalance(userID).pipe(
+          Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
+        )
+
         // Delegate to the core applyUsage which handles full/partial/no coverage accounting and
-        // debits only the covered portion without throwing on partial balance (VAL-SESSION-024).
-        // The core function yields Wallet.Service from context, so provide the wallet instance
-        // captured in this layer closure to keep the method's environment `never`.
+        // debits only the covered portion without throwing on partial balance (VAL-SESSION-015/016/
+        // 017/042). The core function yields Wallet.Service from context, so provide the wallet
+        // instance captured in this layer closure to keep the method's environment `never`.
         const uncovered = yield* applyUsageCredits(userID, costUSD).pipe(Effect.provideService(Wallet.Service, wallet))
 
-        // Emit credit.updated after a debit so the TUI reconciles the lowered balance. Best-effort.
-        yield* emitCreditUpdated(userID).pipe(
+        // Emit credit.updated only after a nonzero debit so the TUI reconciles the lowered balance
+        // (VAL-SESSION-020). No event when nothing is debited — zero cost and no-balance return
+        // early above; this guards the edge case where positive cost rounds to 0 credits needed.
+        yield* Effect.gen(function* () {
+          if (!before) return
+          const after = yield* wallet.getBalance(userID)
+          if (after.lifetimeSpentCredits > before.lifetimeSpentCredits) {
+            yield* events.publish(CreditUpdatedEvent, {
+              balance_credits: after.balanceCredits,
+              lifetime_earned: after.lifetimeEarnedCredits,
+              lifetime_spent: after.lifetimeSpentCredits,
+            })
+          }
+        }).pipe(
           Effect.catch((err) => Effect.logWarning("CodeFree: credit.updated emit skipped", err)),
         )
 

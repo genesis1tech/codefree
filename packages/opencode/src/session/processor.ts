@@ -107,6 +107,7 @@ export const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const codefree = yield* CodeFree.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -423,14 +424,12 @@ export const layer = Layer.effect(
               ctx.reasoningMap[value.id].metadata = value.providerMetadata
             }
             yield* finishReasoning(value.id)
-            // CodeFree: maybe show an ad when extended thinking finishes.
-            // Fire-and-forget — never blocks the actual coding session.
-            yield* CodeFree.maybeShowAd(ctx.sessionID, ctx.assistantMessage.id, "thinking", (part) =>
+            // CodeFree: maybe show an ad when extended thinking finishes (VAL-SESSION-031).
+            // Forked so ad side effects never block the stream event loop (VAL-SESSION-033).
+            yield* codefree.maybeShowAd(ctx.sessionID, ctx.assistantMessage.id, "thinking", (part) =>
               session.updatePart({ ...part, type: "text" }),
             ).pipe(
-              Effect.catch((err) =>
-                Effect.logWarning("CodeFree: ad injection skipped", err),
-              ),
+              Effect.catch((err) => Effect.logWarning("CodeFree: ad injection skipped", err)),
               Effect.forkIn(scope),
             )
             return
@@ -560,13 +559,12 @@ export const layer = Layer.effect(
           case "tool-result": {
             const toolCall = yield* readToolCall(value.id)
             if (!toolCall && value.result.type === "error") return
-            // CodeFree: tool-gap ad slot — between tool execution and next call.
-            yield* CodeFree.maybeShowAd(ctx.sessionID, ctx.assistantMessage.id, "toolgap", (part) =>
+            // CodeFree: tool-gap ad slot — between tool execution and next call (VAL-SESSION-032).
+            // Forked so the stream advances independently of ad side effects (VAL-SESSION-033).
+            yield* codefree.maybeShowAd(ctx.sessionID, ctx.assistantMessage.id, "toolgap", (part) =>
               session.updatePart({ ...part, type: "text" }),
             ).pipe(
-              Effect.catch((err) =>
-                Effect.logWarning("CodeFree: toolgap ad injection skipped", err),
-              ),
+              Effect.catch((err) => Effect.logWarning("CodeFree: toolgap ad injection skipped", err)),
               Effect.forkIn(scope),
             )
             if (value.result.type === "error") {
@@ -736,10 +734,11 @@ export const layer = Layer.effect(
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
-            // CodeFree: try to cover the API cost with ad earnings.
-            // Returns the portion NOT covered by credits (0 = fully covered).
-            // Wrapped so wallet failure never breaks the session.
-            const costCovered = yield* CodeFree.applyUsage(ctx.sessionID, usage.cost).pipe(
+            // CodeFree: try to cover the API cost with ad earnings (VAL-SESSION-034).
+            // Returns the portion NOT covered by credits (0 = fully covered). On failure, the
+            // full cost is treated as uncovered so costCoveredByCredits falls back to 0
+            // (VAL-SESSION-021): a wallet failure never breaks the session.
+            const uncovered = yield* codefree.applyUsage(ctx.sessionID, usage.cost).pipe(
               Effect.catch((err) =>
                 Effect.gen(function* () {
                   yield* Effect.logWarning("CodeFree: usage deduction skipped", err)
@@ -747,7 +746,7 @@ export const layer = Layer.effect(
                 }),
               ),
             )
-            ctx.assistantMessage.costCoveredByCredits = usage.cost - costCovered
+            ctx.assistantMessage.costCoveredByCredits = usage.cost - uncovered
             yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.reason,

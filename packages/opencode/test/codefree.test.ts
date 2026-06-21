@@ -11,6 +11,8 @@ import { ConfigCodefree } from "@opencode-ai/core/config/codefree"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { Global } from "@opencode-ai/core/global"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 import { getImpressionStats } from "@opencode-ai/core/ad/service"
 import { Config } from "@/config/config"
 import { Account } from "@/account/account"
@@ -611,4 +613,189 @@ describe("remote account precedence (VAL-SESSION-025)", () => {
       expect(balance.lifetimeEarnedCredits).toBe(4)
     }),
   )
+})
+
+// =====================================================================================
+// VAL-SESSION-015/016/017/018/042: applyUsage coverage accounting
+// =====================================================================================
+
+// Seed the test user's wallet with `amount` credits before an applyUsage call.
+function seedCredits(amount: number) {
+  return Effect.gen(function* () {
+    const wallet = yield* Wallet.Service
+    yield* wallet.creditWallet(TEST_USER_ID, amount, "bonus", "test seed")
+  })
+}
+
+describe("applyUsage coverage accounting (VAL-SESSION-015/016/017/018/042)", () => {
+  effEnabled.live("full coverage: debits usdToCredits(cost) and returns 0 (VAL-SESSION-015)", () =>
+    Effect.gen(function* () {
+      yield* seedCredits(50)
+      const uncovered = yield* CodeFree.applyUsage(sessionID("full"), 0.2)
+      expect(uncovered).toBe(0)
+      const wallet = yield* Wallet.Service
+      const balance = yield* wallet.getBalance(TEST_USER_ID)
+      expect(balance.balanceCredits).toBe(30)
+      expect(balance.lifetimeSpentCredits).toBe(20)
+    }),
+  )
+
+  effEnabled.live("no balance: returns the full costUSD, no debit (VAL-SESSION-016)", () =>
+    Effect.gen(function* () {
+      const uncovered = yield* CodeFree.applyUsage(sessionID("nobal"), 0.2)
+      expect(uncovered).toBe(0.2)
+      const wallet = yield* Wallet.Service
+      // Wallet may not exist for this user yet (no prior credit) — treat as 0 balance.
+      const balance = yield* wallet.getBalance(TEST_USER_ID).pipe(
+        Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
+      )
+      expect(balance?.balanceCredits ?? 0).toBe(0)
+    }),
+  )
+
+  effEnabled.live("partial coverage: debits available and returns the remainder (VAL-SESSION-017/042)", () =>
+    Effect.gen(function* () {
+      yield* seedCredits(10)
+      const uncovered = yield* CodeFree.applyUsage(sessionID("partial"), 0.5)
+      // Needs 50 credits, only 10 available → debits 10, returns creditsToUsd(40) = 0.4.
+      expect(uncovered).toBe(0.4)
+      const wallet = yield* Wallet.Service
+      const balance = yield* wallet.getBalance(TEST_USER_ID)
+      expect(balance.balanceCredits).toBe(0)
+      expect(balance.lifetimeSpentCredits).toBe(10)
+    }),
+  )
+
+  effEnabled.live("zero/negative cost is a no-op: returns 0, no debit, no events (VAL-SESSION-018)", () =>
+    Effect.gen(function* () {
+      yield* seedCredits(50)
+      const events = yield* collectCodefreeEvents(
+        Effect.gen(function* () {
+          const u1 = yield* CodeFree.applyUsage(sessionID("zero"), 0)
+          const u2 = yield* CodeFree.applyUsage(sessionID("neg"), -1)
+          expect(u1).toBe(0)
+          expect(u2).toBe(0)
+        }),
+      )
+      expect(events.length).toBe(0)
+      const wallet = yield* Wallet.Service
+      const balance = yield* wallet.getBalance(TEST_USER_ID)
+      expect(balance.balanceCredits).toBe(50)
+      expect(balance.lifetimeSpentCredits).toBe(0)
+    }),
+  )
+
+  effEnabled.live("no wallet at all returns full cost without throwing (VAL-SESSION-039)", () =>
+    Effect.gen(function* () {
+      // No prior creditWallet → wallet doesn't exist for this user. applyUsage must return the
+      // full cost without debiting or emitting events (same behavior as the no-user-id guard).
+      const events = yield* collectCodefreeEvents(
+        Effect.gen(function* () {
+          const uncovered = yield* CodeFree.applyUsage(sessionID("nowallet"), 0.3)
+          expect(uncovered).toBe(0.3)
+        }),
+      )
+      expect(events.length).toBe(0)
+    }),
+  )
+})
+
+// =====================================================================================
+// VAL-SESSION-020: applyUsage emits credit.updated only after a nonzero debit
+// =====================================================================================
+
+describe("applyUsage credit.updated emission (VAL-SESSION-020)", () => {
+  effEnabled.live("emits one credit.updated after a nonzero debit", () =>
+    Effect.gen(function* () {
+      yield* seedCredits(50)
+      const events = yield* collectCodefreeEvents(
+        Effect.gen(function* () {
+          yield* CodeFree.applyUsage(sessionID("emit_debit"), 0.2)
+        }),
+      )
+      const credits = events.filter((e) => e.type === "codefree.credit.updated")
+      expect(credits.length).toBe(1)
+      // The emitted balance reflects the post-debit state.
+      expect(credits[0].properties.balance_credits).toBe(30)
+      expect(credits[0].properties.lifetime_spent).toBe(20)
+    }),
+  )
+
+  effEnabled.live("emits NO credit.updated when nothing is debited (zero balance)", () =>
+    Effect.gen(function* () {
+      const events = yield* collectCodefreeEvents(
+        Effect.gen(function* () {
+          yield* CodeFree.applyUsage(sessionID("emit_none"), 0.2)
+        }),
+      )
+      const credits = events.filter((e) => e.type === "codefree.credit.updated")
+      expect(credits.length).toBe(0)
+    }),
+  )
+})
+
+// =====================================================================================
+// VAL-SESSION-035: ad credit then usage debit reconciles to the wallet
+// =====================================================================================
+
+describe("ad credit then usage debit reconciles (VAL-SESSION-035)", () => {
+  effEnabled.live("balance == earned - spent after earning and spending", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const sid = sessionID("reconcile")
+      // Earn 4 credits via an ad.
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_recon"), "toolgap", (p) => Effect.succeed(p))
+      // Spend 1 credit on a small cost ($0.01 = 1 credit).
+      const uncovered = yield* CodeFree.applyUsage(sid, 0.01)
+      expect(uncovered).toBe(0)
+      const balance = yield* wallet.getBalance(TEST_USER_ID)
+      // Invariant: balance == earned - spent.
+      expect(balance.balanceCredits).toBe(balance.lifetimeEarnedCredits - balance.lifetimeSpentCredits)
+      expect(balance.balanceCredits).toBe(3)
+      expect(balance.lifetimeEarnedCredits).toBe(4)
+      expect(balance.lifetimeSpentCredits).toBe(1)
+    }),
+  )
+})
+
+// =====================================================================================
+// VAL-SESSION-030: costCoveredByCredits round-trips through the Assistant schema
+// =====================================================================================
+
+describe("Assistant schema costCoveredByCredits (VAL-SESSION-030)", () => {
+  // A minimal valid Assistant object for schema round-trip tests. Branded ids are constructed via
+  // their `.make()` statics; costCoveredByCredits is overlaid per-test.
+  const assistantFixture: SessionV1.Assistant = {
+    id: SessionV1.MessageID.make("msg_schema_test"),
+    sessionID: SessionV2.ID.make("sess_schema_test"),
+    role: "assistant",
+    time: { created: Date.now() },
+    parentID: SessionV1.MessageID.make("msg_parent"),
+    modelID: ModelV2.ID.make("test-model"),
+    providerID: ProviderV2.ID.make("test"),
+    mode: "build",
+    agent: "build",
+    path: { cwd: "/tmp", root: "/tmp" },
+    cost: 0.05,
+    tokens: {
+      input: 10,
+      output: 5,
+      reasoning: 0,
+      cache: { read: 0, write: 0 },
+    },
+  }
+
+  it("a present costCoveredByCredits value round-trips through encode/decode", () => {
+    const encoded = Schema.encodeSync(SessionV1.Assistant)({ ...assistantFixture, costCoveredByCredits: 0.03 })
+    const decoded = Schema.decodeSync(SessionV1.Assistant)(encoded)
+    expect(decoded.costCoveredByCredits).toBe(0.03)
+  })
+
+  it("an absent costCoveredByCredits stays absent (not coerced to 0)", () => {
+    const fixture = { ...assistantFixture }
+    delete fixture.costCoveredByCredits
+    const encoded = Schema.encodeSync(SessionV1.Assistant)(fixture)
+    const decoded = Schema.decodeSync(SessionV1.Assistant)(encoded)
+    expect(decoded.costCoveredByCredits).toBeUndefined()
+  })
 })
