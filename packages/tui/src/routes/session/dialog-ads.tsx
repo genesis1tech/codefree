@@ -4,6 +4,7 @@ import { useTheme } from "../../context/theme"
 import { useDialog } from "../../ui/dialog"
 import { useWallet } from "../../context/wallet"
 import { AdPreferences } from "../../ui/ad-preferences"
+import { WithdrawPanel } from "../../ui/withdraw-panel"
 import { useBindings } from "../../keymap"
 
 export function DialogAds() {
@@ -42,6 +43,7 @@ export function DialogAds() {
         // AdPreferences persists to the same `codefree_ads_enabled` KV key.
         onChange={(prefs) => wallet.setEnabled(prefs.adsEnabled)}
       />
+      <WithdrawPanel />
       <box flexDirection="row" justifyContent="flex-end" paddingBottom={1}>
         <box paddingLeft={3} paddingRight={3} backgroundColor={theme.primary} onMouseUp={() => dialog.clear()}>
           <text fg={theme.selectedListItemText}>done</text>
