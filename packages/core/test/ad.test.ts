@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "bun:test"
-import { Schema } from "effect"
+import { Effect, Layer, Schema } from "effect"
+import { FetchHttpClient } from "effect/unstable/http"
 import {
   AdCategory,
   AdConfig,
@@ -11,8 +12,10 @@ import {
   CREDITS_PER_CLICK,
   CREDITS_PER_VIEW,
 } from "@opencode-ai/core/ad/types"
-import { formatAdAsMarkdown, resetFrequencyCaps, selectAd, shouldShowAd, trackImpression } from "@opencode-ai/core/ad/injector"
-import { clearImpressions, fetchAds, getImpressionStats, recordClick, recordImpression } from "@opencode-ai/core/ad/service"
+import { formatAdAsMarkdown, resetFrequencyCaps, scoreAd, selectAd, shouldShowAd, SLOT_CATEGORY_AFFINITY, trackImpression } from "@opencode-ai/core/ad/injector"
+import { AdSource, clearImpressions, fetchAds, getImpressionStats, recordClick, recordImpression, Store } from "@opencode-ai/core/ad/service"
+import { Database } from "@opencode-ai/core/database/database"
+import { testEffect } from "./lib/effect"
 
 // -- Test helpers --
 
@@ -46,10 +49,14 @@ function makeConfig(overrides: {
   })
 }
 
+// In-memory database provisioned with the ad tables via the fresh-DB schema snapshot.
+const database = Database.layerFromPath(":memory:")
+const storeLayer = Store.layer.pipe(Layer.provide(database))
+const eff = testEffect(storeLayer)
+
 describe("Ad Engine", () => {
   beforeEach(() => {
     resetFrequencyCaps()
-    clearImpressions()
   })
 
   describe("shouldShowAd", () => {
@@ -230,6 +237,59 @@ describe("Ad Engine", () => {
     })
   })
 
+  describe("scoreAd (Phase 1 slot-aware targeting)", () => {
+    it("scores every category in a slot's affinity set higher than the base (VAL-AD-029)", () => {
+      const devtoolAd = makeAd("sc-1", "sc-adv-1", "devtool")
+      // thinking affinity includes devtool, so it scores above the 100 base.
+      expect(scoreAd(devtoolAd, "thinking", [])).toBe(150)
+      // idle affinity does not include devtool, so it stays at the base.
+      expect(scoreAd(devtoolAd, "idle", [])).toBe(100)
+    })
+
+    it("adds a user-preference bonus on top of the slot affinity bonus (VAL-AD-030)", () => {
+      const devtoolAd = makeAd("sc-2", "sc-adv-2", "devtool")
+      // thinking affinity (devtool) + user preference (devtool) = 100 + 50 + 25.
+      expect(scoreAd(devtoolAd, "thinking", ["devtool"])).toBe(175)
+      // user preference alone, no slot affinity: 100 + 25.
+      expect(scoreAd(devtoolAd, "idle", ["devtool"])).toBe(125)
+    })
+
+    it("selectAd prioritizes an affinity-matched ad before a non-matched one (VAL-AD-031)", () => {
+      // saas is in toolgap affinity; recruiting is not. With empty user categories both are
+      // eligible, but saas should be picked first in the rotation.
+      const saasAd = makeAd("pr-1", "pr-adv-1", "saas")
+      const recruitingAd = makeAd("pr-2", "pr-adv-2", "recruiting")
+      const config = makeConfig({ frequency_cap: 3 })
+
+      const first = selectAd("toolgap", [], [recruitingAd, saasAd], config)
+      expect(first!.id).toBe(saasAd.id)
+    })
+
+    it("selectAd still rotates through every eligible ad over a full cycle (VAL-AD-032)", () => {
+      const devtoolAd = makeAd("rot-1", "rot-adv-1", "devtool")
+      const saasAd = makeAd("rot-2", "rot-adv-2", "saas")
+      const config = makeConfig({ frequency_cap: 3 })
+
+      const seen = new Set<string>()
+      for (let i = 0; i < 2; i++) {
+        const ad = selectAd("toolgap", [], [devtoolAd, saasAd], config)
+        if (ad) seen.add(ad.id)
+      }
+      expect(seen.has(devtoolAd.id)).toBe(true)
+      expect(seen.has(saasAd.id)).toBe(true)
+    })
+
+    it("different slot types re-prioritize the same pool differently (VAL-AD-033)", () => {
+      // education is in thinking affinity; saas is in toolgap affinity. Same two ads, two slots.
+      const educationAd = makeAd("sl-1", "sl-adv-1", "education")
+      const saasAd = makeAd("sl-2", "sl-adv-2", "saas")
+      const config = makeConfig({ frequency_cap: 3 })
+
+      const thinkingPick = selectAd("thinking", [], [saasAd, educationAd], config)
+      expect(thinkingPick!.id).toBe(educationAd.id)
+    })
+  })
+
   describe("trackImpression", () => {
     it("returns a populated AdImpression matching all inputs (VAL-AD-017)", () => {
       const ad = makeAd("imp-1", "imp-adv-1", "devtool")
@@ -306,28 +366,30 @@ describe("Ad Engine", () => {
     })
   })
 
-  describe("recordImpression and getImpressionStats", () => {
-    it("stores impressions in the in-memory store (VAL-AD-022)", () => {
+  describe("recordImpression and getImpressionStats (DB-backed)", () => {
+    eff.effect("persists impressions durably and stats reflect them (VAL-AD-022)", Effect.gen(function* () {
+      yield* clearImpressions()
       const ad = makeAd("store-1", "store-adv-1", "devtool")
 
-      const before = getImpressionStats("ses-store")
+      const before = yield* getImpressionStats("ses-store")
       expect(before.total_ads).toBe(0)
 
-      recordImpression(trackImpression(ad, "thinking", "ses-store", "usr-1", 2000))
+      yield* recordImpression(trackImpression(ad, "thinking", "ses-store", "usr-1", 2000))
 
-      const after = getImpressionStats("ses-store")
+      const after = yield* getImpressionStats("ses-store")
       expect(after.total_ads).toBe(1)
-    })
+    }))
 
-    it("computes credits_earned = views*4 + clicks*100 (VAL-AD-023)", () => {
+    eff.effect("computes credits_earned = views*4 + clicks*100 (VAL-AD-023)", Effect.gen(function* () {
+      yield* clearImpressions()
       const ad = makeAd("math-1", "math-adv-1", "devtool")
 
       // 3 views, 0 clicks
       for (let i = 0; i < 3; i++) {
-        recordImpression(trackImpression(ad, "thinking", "ses-math", "usr-1", 2000))
+        yield* recordImpression(trackImpression(ad, "thinking", "ses-math", "usr-1", 2000))
       }
 
-      let stats = getImpressionStats("ses-math")
+      let stats = yield* getImpressionStats("ses-math")
       expect(stats.total_ads).toBe(3)
       expect(stats.total_clicks).toBe(0)
       expect(stats.credits_earned).toBe(3 * CREDITS_PER_VIEW)
@@ -335,16 +397,22 @@ describe("Ad Engine", () => {
       // record 2 more impressions and click them
       const clickable1 = trackImpression(ad, "thinking", "ses-math", "usr-1", 2000)
       const clickable2 = trackImpression(ad, "thinking", "ses-math", "usr-1", 2000)
-      recordImpression(clickable1)
-      recordImpression(clickable2)
-      recordClick(clickable1.id, "https://example.com/click")
-      recordClick(clickable2.id, "https://example.com/click")
+      yield* recordImpression(clickable1)
+      yield* recordImpression(clickable2)
+      yield* recordClick(clickable1.id, "https://example.com/click")
+      yield* recordClick(clickable2.id, "https://example.com/click")
 
-      stats = getImpressionStats("ses-math")
+      stats = yield* getImpressionStats("ses-math")
       expect(stats.total_ads).toBe(5)
       expect(stats.total_clicks).toBe(2)
       expect(stats.credits_earned).toBe(5 * CREDITS_PER_VIEW + 2 * CREDITS_PER_CLICK)
-    })
+    }))
+
+    eff.effect("recordClick is a no-op for an unknown impression id", Effect.gen(function* () {
+      yield* clearImpressions()
+      // Should not throw and should complete without error.
+      yield* recordClick("nonexistent-id", "https://example.com/click")
+    }))
   })
 
   describe("schema validation", () => {
@@ -358,4 +426,89 @@ describe("Ad Engine", () => {
       }
     })
   })
+})
+
+// =====================================================================================
+// AdSource: remote ad server fetch with placeholder fallback (VAL-AD-025/026/027)
+// =====================================================================================
+
+const adSourceLayer = AdSource.layer.pipe(Layer.provide(FetchHttpClient.layer))
+const srcEff = testEffect(adSourceLayer)
+
+describe("AdSource (Phase 1 remote fetch)", () => {
+  srcEff.live("returns placeholders when no ad server URL is configured (VAL-AD-025)", Effect.gen(function* () {
+    const svc = yield* AdSource.Service
+    const ads = yield* svc.fetchAds(undefined)
+    expect(ads.length).toBe(6)
+    // All are the hardcoded placeholder creatives.
+    expect(ads[0].id).toBe(AdCreativeID.make("ad-vercel-001"))
+  }))
+
+  srcEff.live("falls back to placeholders when the ad server is unreachable (VAL-AD-026)", Effect.gen(function* () {
+    const svc = yield* AdSource.Service
+    // A port that nothing listens on → immediate connection refused, well under the 5s timeout.
+    const ads = yield* svc.fetchAds("http://127.0.0.1:59999")
+    expect(ads.length).toBe(6)
+    expect(ads[0].id).toBe(AdCreativeID.make("ad-vercel-001"))
+  }))
+
+  srcEff.live("fetches real ads from a mock ad server (VAL-AD-027)", Effect.gen(function* () {
+    // Spin up a throwaway Bun HTTP server that returns a single ad creative.
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        if (new URL(req.url).pathname === "/ads") {
+          return new Response(
+            JSON.stringify({
+              ads: [
+                {
+                  id: "ad-mock-001",
+                  advertiser_id: "mock-co",
+                  headline: "Mock Ad Headline",
+                  body: "Mock ad body text.",
+                  cta_text: "Try it",
+                  cta_url: "https://mock.test",
+                  display_url: "mock.test",
+                  category: "devtool",
+                  format: "markdown",
+                },
+              ],
+            }),
+            { headers: { "content-type": "application/json" } },
+          )
+        }
+        return new Response("not found", { status: 404 })
+      },
+    })
+
+    try {
+      const svc = yield* AdSource.Service
+      const ads = yield* svc.fetchAds(`http://localhost:${server.port}`)
+      expect(ads.length).toBe(1)
+      expect(ads[0].id).toBe(AdCreativeID.make("ad-mock-001"))
+      expect(ads[0].headline).toBe("Mock Ad Headline")
+      expect(ads[0].advertiser_id).toBe(AdvertiserID.make("mock-co"))
+    } finally {
+      server.stop()
+    }
+  }))
+
+  srcEff.live("falls back to placeholders on a non-200 response (VAL-AD-028)", Effect.gen(function* () {
+    const server = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response("error", { status: 500 })
+      },
+    })
+
+    try {
+      const svc = yield* AdSource.Service
+      const ads = yield* svc.fetchAds(`http://localhost:${server.port}`)
+      // filterStatusOk rejects 500, so we fall back to placeholders.
+      expect(ads.length).toBe(6)
+      expect(ads[0].id).toBe(AdCreativeID.make("ad-vercel-001"))
+    } finally {
+      server.stop()
+    }
+  }))
 })

@@ -3,6 +3,7 @@ import path from "path"
 import os from "os"
 import { mkdtempSync } from "node:fs"
 import { Effect, Exit, Layer, Option, Schema } from "effect"
+import { FetchHttpClient } from "effect/unstable/http"
 import { Database } from "@opencode-ai/core/database/database"
 import { Wallet } from "@opencode-ai/core/wallet"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -13,7 +14,9 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { Global } from "@opencode-ai/core/global"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { getImpressionStats } from "@opencode-ai/core/ad/service"
+import { getImpressionStats, Store, fetchAds, AdSource } from "@opencode-ai/core/ad/service"
+import { trackImpression } from "@opencode-ai/core/ad/injector"
+import { AD_VIEW_CREDIT_REWARD, AFFILIATE_CLICK_CREDIT_REWARD } from "@opencode-ai/core/wallet/config"
 import { Config } from "@/config/config"
 import { Account } from "@/account/account"
 import { CodeFree } from "@/session/codefree"
@@ -97,8 +100,9 @@ function buildLayer(opts: {
   const globalLayer = opts.global ?? Global.layerWith({ data: localIdDir })
   const eventBridge = EventV2Bridge.layer.pipe(Layer.provide(EventV2.layer))
   const walletLayer = opts.wallet ?? Wallet.layer
-  const sharedDeps = Layer.mergeAll(walletLayer, eventBridge, opts.account, opts.config, globalLayer).pipe(
+  const sharedDeps = Layer.mergeAll(walletLayer, Store.layer, AdSource.layer, eventBridge, opts.account, opts.config, globalLayer).pipe(
     Layer.provide(database),
+    Layer.provide(FetchHttpClient.layer),
   )
   const codefreeWithDeps = CodeFree.layer.pipe(Layer.provide(sharedDeps))
   return Layer.mergeAll(codefreeWithDeps, sharedDeps)
@@ -286,7 +290,7 @@ describe("maybeShowAd happy path (VAL-SESSION-001/002/003/006)", () => {
     Effect.gen(function* () {
       const sid = sessionID("hp_impression")
       yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_hp_imp"), "toolgap", (p) => Effect.succeed(p))
-      const stats = getImpressionStats(sid)
+      const stats = yield* getImpressionStats(sid)
       expect(stats.total_ads).toBe(1)
     }),
   )
@@ -394,7 +398,7 @@ describe("real config drives behavior (VAL-SESSION-007/008)", () => {
         CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_disabled"), "toolgap", recordingPublisher(published)),
       )
       expect(published.length).toBe(0)
-      expect(getImpressionStats(sid).total_ads).toBe(0)
+      expect((yield* getImpressionStats(sid)).total_ads).toBe(0)
       const balance = yield* wallet.getBalance(TEST_USER_ID).pipe(
         Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
       )
@@ -411,7 +415,7 @@ describe("real config drives behavior (VAL-SESSION-007/008)", () => {
       const sid = sessionID("real_cfg")
       yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_real_cfg"), "toolgap", recordingPublisher(published))
       expect(published.length).toBe(0)
-      expect(getImpressionStats(sid).total_ads).toBe(0)
+      expect((yield* getImpressionStats(sid)).total_ads).toBe(0)
     }),
   )
 })
@@ -510,7 +514,7 @@ describe("fire-and-forget and abort semantics (VAL-SESSION-012/013/014)", () => 
         Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
       )
       expect(balance?.balanceCredits ?? 0).toBe(0)
-      expect(getImpressionStats(sid).total_ads).toBe(0)
+      expect((yield* getImpressionStats(sid)).total_ads).toBe(0)
       // The failed ad did not count toward caps: a subsequent call with a working publish fires.
       const published: SessionV1.TextPart[] = []
       yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_abort_ok"), "toolgap", recordingPublisher(published))
@@ -527,7 +531,7 @@ describe("fire-and-forget and abort semantics (VAL-SESSION-012/013/014)", () => 
         CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_noad"), "toolgap", recordingPublisher(published)),
       )
       expect(published.length).toBe(0)
-      expect(getImpressionStats(sid).total_ads).toBe(0)
+      expect((yield* getImpressionStats(sid)).total_ads).toBe(0)
       const balance = yield* wallet.getBalance(TEST_USER_ID).pipe(
         Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
       )
@@ -870,5 +874,112 @@ describe("CodeFree hydrateWallet emits credit.updated with the persisted balance
         // Exit already asserted above; this map ensures the effect runs to completion.
       }),
     ),
+  )
+})
+
+// =====================================================================================
+// VAL-SESSION-026: clickAd credits the wallet +100 (affiliate_click) and persists the click
+// =====================================================================================
+
+describe("CodeFree clickAd credits the wallet +100 and emits events (VAL-SESSION-026)", () => {
+  effEnabled.effect("clickAd credits the wallet +100 with type affiliate_click", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const adStore = yield* Store.Service
+      const sid = sessionID("click_credit")
+
+      // Record a manual impression directly via the AdStore so we have a known impression id.
+      const impression = trackImpression(
+        fetchAds(ConfigCodefree.toAdConfig(new ConfigCodefree.Info({ enabled: true })))[0],
+        "toolgap",
+        sid,
+        TEST_USER_ID,
+        1000,
+      )
+      yield* adStore.recordImpression(impression)
+
+      // clickAd should credit +100 (affiliate_click).
+      yield* CodeFree.clickAd(sid, impression.id, "https://example.com/click", "Test ad")
+
+      const balance = yield* wallet.getBalance(TEST_USER_ID)
+      expect(balance.balanceCredits).toBe(AFFILIATE_CLICK_CREDIT_REWARD)
+      expect(balance.lifetimeEarnedCredits).toBe(AFFILIATE_CLICK_CREDIT_REWARD)
+    }),
+  )
+
+  effEnabled.effect("view (+4) then click (+100) credits 104 total, and stats reflect the click", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const adStore = yield* Store.Service
+      const sid = sessionID("click_full")
+
+      // Show an ad via the CodeFree service (credits +4 view + records impression).
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_view"), "toolgap", (p) => Effect.succeed(p))
+
+      // Record a second manual impression directly so we have a known id to click.
+      const impression = trackImpression(
+        fetchAds(ConfigCodefree.toAdConfig(new ConfigCodefree.Info({ enabled: true })))[0],
+        "toolgap",
+        sid,
+        TEST_USER_ID,
+        1000,
+      )
+      yield* adStore.recordImpression(impression)
+
+      // Click it (credits +100).
+      yield* CodeFree.clickAd(sid, impression.id, "https://example.com/click2", "Second ad")
+
+      const balance = yield* wallet.getBalance(TEST_USER_ID)
+      expect(balance.balanceCredits).toBe(AD_VIEW_CREDIT_REWARD + AFFILIATE_CLICK_CREDIT_REWARD)
+
+      // Stats: 2 total impressions, 1 click. credits_earned = 2*4 + 1*100 = 108.
+      const stats = yield* getImpressionStats(sid)
+      expect(stats.total_ads).toBe(2)
+      expect(stats.total_clicks).toBe(1)
+      expect(stats.credits_earned).toBe(2 * AD_VIEW_CREDIT_REWARD + 1 * AFFILIATE_CLICK_CREDIT_REWARD)
+    }),
+  )
+
+  effEnabled.effect("clickAd emits codefree.ad.click and codefree.credit.updated events", () =>
+    collectCodefreeEvents(
+      Effect.gen(function* () {
+        const adStore = yield* Store.Service
+        const sid = sessionID("click_events")
+
+        const impression = trackImpression(
+          fetchAds(ConfigCodefree.toAdConfig(new ConfigCodefree.Info({ enabled: true })))[0],
+          "toolgap",
+          sid,
+          TEST_USER_ID,
+          1000,
+        )
+        yield* adStore.recordImpression(impression)
+        yield* CodeFree.clickAd(sid, impression.id, "https://example.com/click3", "Event ad")
+      }),
+    ).pipe(
+      Effect.map((events) => {
+        const clickEvents = events.filter((e) => e.type === "codefree.ad.click")
+        const creditEvents = events.filter((e) => e.type === "codefree.credit.updated")
+        expect(clickEvents.length).toBe(1)
+        expect(clickEvents[0].properties.amount).toBe(AFFILIATE_CLICK_CREDIT_REWARD)
+        expect(creditEvents.length).toBe(1)
+        expect(creditEvents[0].properties.balance_credits).toBe(AFFILIATE_CLICK_CREDIT_REWARD)
+      }),
+    ),
+  )
+
+  effEnabled.effect("clickAd for an unknown impression id is a no-op (credits nothing)", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const sid = sessionID("click_unknown")
+
+      yield* CodeFree.clickAd(sid, "nonexistent-impression", "https://example.com/nope", "Ghost ad")
+
+      // No wallet exists yet for this user since no ad was shown and no click credited.
+      const balance = yield* wallet.getBalance(TEST_USER_ID).pipe(
+        Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
+      )
+      expect(balance).toBeNull()
+    }),
   )
 })

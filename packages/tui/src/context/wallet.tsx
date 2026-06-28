@@ -103,6 +103,11 @@ export const { use: useWallet, provider: WalletProvider } = createSimpleContext(
         recordAdView(amount)
         return
       }
+      if (type === "codefree.ad.click") {
+        const amount = (evt.properties as { amount?: number }).amount ?? CLICK_CREDIT
+        recordClick(amount)
+        return
+      }
       if (type === "codefree.credit.updated") {
         const properties = evt.properties as {
           balance_credits?: number

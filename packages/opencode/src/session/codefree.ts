@@ -3,14 +3,15 @@ import { Effect, Context, Layer, Option, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Wallet } from "@opencode-ai/core/wallet"
 import { shouldShowAd, selectAd, formatAdAsMarkdown, trackImpression } from "@opencode-ai/core/ad/injector"
-import { fetchAds, recordImpression } from "@opencode-ai/core/ad/service"
-import { AD_VIEW_CREDIT_REWARD } from "@opencode-ai/core/wallet/config"
+import { Store as AdStore, AdSource } from "@opencode-ai/core/ad/service"
+import { AD_VIEW_CREDIT_REWARD, AFFILIATE_CLICK_CREDIT_REWARD } from "@opencode-ai/core/wallet/config"
 import { ConfigCodefree } from "@opencode-ai/core/config/codefree"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Global } from "@opencode-ai/core/global"
 import { applyUsage as applyUsageCredits } from "@opencode-ai/core/codefree"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { LayerNodePlatform } from "@opencode-ai/core/effect/layer-node-platform"
 import { Account } from "@/account/account"
 import { Config } from "@/config/config"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -29,6 +30,16 @@ const AdImpressionEvent = EventV2.define({
     amount: Schema.Number,
     ad_id: Schema.String,
     slot_type: Schema.Literals(["thinking", "toolgap", "idle"]),
+    session_id: Schema.String,
+  },
+})
+
+const AdClickEvent = EventV2.define({
+  type: "codefree.ad.click",
+  schema: {
+    amount: Schema.Number,
+    ad_id: Schema.String,
+    impression_id: Schema.String,
     session_id: Schema.String,
   },
 })
@@ -89,6 +100,15 @@ export interface Interface {
     sessionID: SessionID,
     costUSD: number,
   ) => Effect.Effect<number, Wallet.WalletNotFoundError | Wallet.InsufficientBalanceError>
+  // Records an ad click: persists the click event to the AdStore and credits the resolved user's
+  // wallet with AFFILIATE_CLICK_CREDIT_REWARD (affiliate_click type), then emits credit.updated.
+  // Fire-and-forget from the TUI/caller — never breaks the session (VAL-SESSION-026).
+  readonly clickAd: (
+    sessionID: SessionID,
+    impressionID: string,
+    clickURL: string,
+    adHeadline?: string,
+  ) => Effect.Effect<void>
   // Boot/session-start hydration: reads the resolved user's persisted wallet balance and emits a
   // single codefree.credit.updated event so the TUI footer reconciles to the persisted balance on
   // restart (not 0). Fire-and-forget from the processor — never breaks the session (VAL-TUI-025).
@@ -108,6 +128,8 @@ export const layer = Layer.effect(
     // so each method's environment stays `never` (deps are not re-yielded per call).
     const account = yield* Account.Service
     const wallet = yield* Wallet.Service
+    const adStore = yield* AdStore.Service
+    const adSource = yield* AdSource.Service
     const config = yield* Config.Service
     const events = yield* EventV2Bridge.Service
     const global = yield* Global.Service
@@ -118,6 +140,12 @@ export const layer = Layer.effect(
     const readAdConfig = Effect.fnUntraced(function* () {
       const info = yield* config.get()
       return ConfigCodefree.toAdConfig(info.codefree)
+    })
+
+    // Read the ad server URL from the codefree config block. Unset => local placeholders (Phase 0).
+    const readAdServerURL = Effect.fnUntraced(function* () {
+      const info = yield* config.get()
+      return info.codefree?.ad_server_url
     })
 
     // Resolve the user id used for impression attribution and wallet crediting. A remote account
@@ -164,7 +192,8 @@ export const layer = Layer.effect(
         const countThisHour = getAdCountThisHour(sessionID)
         if (!shouldShowAd(slotType, lastAdTime, countThisHour, adConfig)) return
 
-        const availableAds = fetchAds(adConfig)
+        const adServerUrl = yield* readAdServerURL()
+        const availableAds = yield* adSource.fetchAds(adServerUrl)
         const ad = selectAd(slotType, adConfig.categories, availableAds, adConfig)
         // No eligible ad => no side effects (VAL-SESSION-014).
         if (!ad) return
@@ -194,7 +223,7 @@ export const layer = Layer.effect(
             userID ?? "anonymous",
             Date.now() - lastAdTime,
           )
-          recordImpression(impression)
+          yield* adStore.recordImpression(impression)
 
           // The ad was shown: emit the impression event (amount is the standardized view reward).
           yield* events.publish(AdImpressionEvent, {
@@ -277,6 +306,53 @@ export const layer = Layer.effect(
         return uncovered
       }),
 
+      clickAd: Effect.fn("CodeFree.clickAd")(function* (
+        sessionID: SessionID,
+        impressionID: string,
+        clickURL: string,
+        adHeadline = "Ad click",
+      ) {
+        // Resolve the user id first so the click is attributed to the same wallet the view credited.
+        const userID = yield* resolveUserID()
+
+        // Persist the click to the AdStore (updates the impression row + inserts a click event row).
+        // Fire-and-forget: a wallet/event failure is logged but never breaks the caller (VAL-SESSION-026).
+        yield* Effect.gen(function* () {
+          const recorded = yield* adStore.recordClick(impressionID, clickURL)
+          // Unknown impression id: the click was not recorded, so do not credit or emit.
+          if (!recorded) return
+
+          yield* events.publish(AdClickEvent, {
+            amount: AFFILIATE_CLICK_CREDIT_REWARD,
+            ad_id: impressionID,
+            impression_id: impressionID,
+            session_id: sessionID,
+          })
+
+          if (userID) {
+            const credited = yield* wallet.creditWallet(
+              userID,
+              AFFILIATE_CLICK_CREDIT_REWARD,
+              "affiliate_click",
+              `Ad click credit: ${adHeadline}`,
+              impressionID,
+            )
+            yield* events.publish(CreditUpdatedEvent, {
+              balance_credits: credited.balanceCredits,
+              lifetime_earned: credited.lifetimeEarnedCredits,
+              lifetime_spent: credited.lifetimeSpentCredits,
+            })
+          }
+        }).pipe(
+          Effect.catchDefect((defect) =>
+            Effect.logWarning("CodeFree: click side-effects defect (non-breaking)", defect),
+          ),
+          Effect.catch((err) =>
+            Effect.logWarning("CodeFree: click side-effects failed (persist/credit/event)", err),
+          ),
+        )
+      }),
+
       hydrateWallet: Effect.fn("CodeFree.hydrateWallet")(function* (_sessionID: SessionID) {
         // Resolve the user id (remote account or stable local id) and read the persisted wallet
         // balance, then emit a single codefree.credit.updated so the TUI footer reconciles to the
@@ -305,13 +381,15 @@ export const layer = Layer.effect(
 )
 
 // The CodeFree dependency layer provides every service the codefree feature needs at runtime:
-// Wallet (SQLite credit ledger), Config (real opencode.json codefree block), Account (user id
-// resolution), Global (stable local user id persistence), and EventV2 (ephemeral ad/credit events)
-// via EventV2Bridge. Provided into the SessionProcessor layer so `yield* CodeFree.maybeShowAd(...)`
-// / `applyUsage(...)` resolve.
+// Wallet (SQLite credit ledger), AdStore (durable impression/click persistence), Config (real
+// opencode.json codefree block), Account (user id resolution), Global (stable local user id
+// persistence), and EventV2 (ephemeral ad/credit events) via EventV2Bridge. Provided into the
+// SessionProcessor layer so `yield* CodeFree.maybeShowAd(...)` / `applyUsage(...)` resolve.
 export const defaultLayer = Layer.suspend(() =>
   layer.pipe(
     Layer.provide(Wallet.defaultLayer),
+    Layer.provide(AdStore.defaultLayer),
+    Layer.provide(AdSource.defaultLayer),
     Layer.provide(Account.defaultLayer),
     Layer.provide(Config.defaultLayer),
     Layer.provide(EventV2Bridge.defaultLayer),
@@ -323,6 +401,8 @@ export const node = LayerNode.make(layer, [
   Account.node,
   // Wallet lives in core and has no LayerNode of its own; it only needs the shared Database node.
   LayerNode.make(Wallet.layer, [Database.node]),
+  LayerNode.make(AdStore.layer, [Database.node]),
+  LayerNode.make(AdSource.layer, [LayerNodePlatform.httpClient]),
   Config.node,
   EventV2Bridge.node,
   Global.node,
@@ -352,6 +432,16 @@ export const applyUsage = Effect.fn("CodeFree.applyUsage")(function* (sessionID:
 export const hydrateWallet = Effect.fn("CodeFree.hydrateWallet")(function* (sessionID: SessionID) {
   const svc = yield* Service
   yield* svc.hydrateWallet(sessionID)
+})
+
+export const clickAd = Effect.fn("CodeFree.clickAd")(function* (
+  sessionID: SessionID,
+  impressionID: string,
+  clickURL: string,
+  adHeadline?: string,
+) {
+  const svc = yield* Service
+  yield* svc.clickAd(sessionID, impressionID, clickURL, adHeadline)
 })
 
 export * as CodeFree from "./codefree"
