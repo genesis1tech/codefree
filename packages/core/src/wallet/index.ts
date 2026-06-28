@@ -22,7 +22,15 @@ export type TransactionID = typeof TransactionID.Type
 
 // --- Domain types ---
 
-export const TransactionType = Schema.Literals(["ad_view", "affiliate_click", "api_usage", "bonus", "adjustment"])
+export const TransactionType = Schema.Literals([
+  "ad_view",
+  "affiliate_click",
+  "api_usage",
+  "bonus",
+  "adjustment",
+  "withdrawal",
+  "withdrawal_refund",
+])
 export type TransactionType = typeof TransactionType.Type
 
 export class WalletInfo extends Schema.Class<WalletInfo>("Wallet.Info")({
