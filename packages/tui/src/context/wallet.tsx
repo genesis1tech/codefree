@@ -99,13 +99,11 @@ export const { use: useWallet, provider: WalletProvider } = createSimpleContext(
     const unsubscribe = event.subscribe((evt) => {
       const type = evt.type as string
       if (type === "codefree.ad.impression") {
-        const amount = (evt.properties as { amount?: number }).amount ?? IMPRESSION_CREDIT
-        recordAdView(amount)
+        setStore("session_ads_seen", store.session_ads_seen + 1)
         return
       }
       if (type === "codefree.ad.click") {
-        const amount = (evt.properties as { amount?: number }).amount ?? CLICK_CREDIT
-        recordClick(amount)
+        setStore("session_clicks", store.session_clicks + 1)
         return
       }
       if (type === "codefree.credit.updated") {

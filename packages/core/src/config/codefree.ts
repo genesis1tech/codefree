@@ -28,6 +28,9 @@ export class Info extends Schema.Class<Info>("ConfigV2.Codefree")({
   ad_server_url: Schema.String.pipe(Schema.optional).annotate({
     description: "Remote ad server API base URL. When unset, local placeholder ads are used (Phase 0).",
   }),
+  gateway_url: Schema.String.pipe(Schema.optional).annotate({
+    description: "Local OpenAI-compatible gateway URL for credit redemption.",
+  }),
 }) {}
 
 export const defaults = {

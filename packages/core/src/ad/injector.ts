@@ -1,4 +1,4 @@
-import { AdCreative, AdConfig, AdImpression, AdImpressionID } from "./types"
+import { AdCreative, AdConfig, AdImpression, AdImpressionID, SLOT_MIN_DURATIONS } from "./types"
 
 type AdSlotType = "thinking" | "toolgap" | "idle"
 
@@ -127,6 +127,8 @@ export function trackImpression(
     shown_at: Date.now(),
     duration_ms: durationMs,
     clicked: false,
+    credited: false,
+    slot_min_ms: SLOT_MIN_DURATIONS[slotType],
   })
 }
 

@@ -1,10 +1,10 @@
-import { eq } from "drizzle-orm"
+import { eq, and, gte, sql } from "drizzle-orm"
 import { Context, Effect, Layer, Schema } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Database } from "../database/database"
 import { Identifier } from "../util/identifier"
-import { AdClickEventTable, AdImpressionTable } from "./sql"
-import { AdCreative, AdCreativeID, AdvertiserID, AdConfig, AdImpression, CREDITS_PER_CLICK, CREDITS_PER_VIEW, ImpressionStats } from "./types"
+import { AdClickEventTable, AdImpressionTable, CodefreePreferenceTable } from "./sql"
+import { AdCreative, AdCreativeID, AdImpressionID, AdvertiserID, AdConfig, AdImpression, CREDITS_PER_CLICK, CREDITS_PER_VIEW, ImpressionStats } from "./types"
 
 // -- Phase 0 placeholder ads --
 
@@ -111,7 +111,11 @@ const AdServerAd = Schema.Struct({
 const AdServerResponse = Schema.Struct({ ads: Schema.Array(AdServerAd) })
 
 interface AdSourceInterface {
-  readonly fetchAds: (adServerUrl?: string) => Effect.Effect<ReadonlyArray<AdCreative>>
+  readonly fetchAds: (
+    adServerUrl?: string,
+    slot?: string,
+    categories?: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyArray<AdCreative>>
 }
 
 class AdSourceService extends Context.Service<AdSourceService, AdSourceInterface>()("@opencode/AdSource") {}
@@ -138,8 +142,8 @@ export const adSourceLayer = Layer.effect(
     // Per-URL cache: { url, ads, fetchedAt }. Undefined = no valid cache entry.
     let cache: { url: string; ads: ReadonlyArray<AdCreative>; fetchedAt: number } | undefined
 
-    const fetchRemote = (adServerUrl: string) =>
-      HttpClientRequest.get(`${adServerUrl}/ads`).pipe(
+    const fetchRemote = (url: string) =>
+      HttpClientRequest.get(url).pipe(
         HttpClientRequest.setHeader("Accept", "application/json"),
         http.execute,
         Effect.flatMap((res) => HttpClientResponse.schemaBodyJson(AdServerResponse)(res)),
@@ -148,22 +152,26 @@ export const adSourceLayer = Layer.effect(
       )
 
     return AdSourceService.of({
-      fetchAds: Effect.fn("AdSource.fetchAds")(function* (adServerUrl) {
+      fetchAds: Effect.fn("AdSource.fetchAds")(function* (adServerUrl, slot, categories) {
         // No server configured — return the local placeholder pool (Phase 0 behavior).
         if (!adServerUrl) return PLACEHOLDER_ADS
 
+        const params = new URLSearchParams()
+        if (slot) params.set("slot", slot)
+        if (categories && categories.length > 0) params.set("categories", categories.join(","))
+        const query = params.toString()
+        const url = query ? `${adServerUrl}/ads?${query}` : `${adServerUrl}/ads`
+
         // Serve from cache if still fresh.
         const now = Date.now()
-        if (cache && cache.url === adServerUrl && now - cache.fetchedAt < AD_FETCH_TTL_MS) {
+        if (cache && cache.url === url && now - cache.fetchedAt < AD_FETCH_TTL_MS) {
           return cache.ads
         }
 
-        // Fetch from the remote ad server. Any failure (network, parse, timeout) falls back to
-        // the last cached result for this URL, or placeholders if nothing is cached.
-        const result = yield* fetchRemote(adServerUrl).pipe(Effect.catch(() => Effect.succeed(null)))
+        const result = yield* fetchRemote(url).pipe(Effect.catch(() => Effect.succeed(null)))
 
         if (result) {
-          cache = { url: adServerUrl, ads: result, fetchedAt: now }
+          cache = { url, ads: result, fetchedAt: now }
           return result
         }
 
@@ -187,8 +195,18 @@ export const AdSource = {
 
 interface StoreInterface {
   readonly recordImpression: (impression: AdImpression) => Effect.Effect<void>
+  readonly getImpression: (impressionId: string) => Effect.Effect<AdImpression | null>
+  readonly markCredited: (impressionId: string) => Effect.Effect<boolean>
+  readonly setImpressionShownAt: (impressionId: string, shownAt: number) => Effect.Effect<void>
   readonly recordClick: (impressionId: string, clickUrl: string) => Effect.Effect<boolean>
   readonly getImpressionStats: (sessionId: string) => Effect.Effect<ImpressionStats>
+  readonly getTodayStats: (userId: string) => Effect.Effect<ImpressionStats>
+  readonly getPreference: (userId: string) => Effect.Effect<{ enabled: boolean; categories: string[] } | null>
+  readonly upsertPreference: (
+    userId: string,
+    enabled: boolean,
+    categories: string[],
+  ) => Effect.Effect<{ enabled: boolean; categories: string[] }>
   readonly clearImpressions: () => Effect.Effect<void>
 }
 
@@ -213,7 +231,46 @@ export const layer = Layer.effect(
             duration_ms: impression.duration_ms,
             clicked: impression.clicked ? 1 : 0,
             click_url: impression.click_url ?? null,
+            credited: impression.credited ? 1 : 0,
+            slot_min_ms: impression.slot_min_ms,
           })
+          .run()
+          .pipe(Effect.orDie)
+      }),
+
+      getImpression: Effect.fn("AdStore.getImpression")(function* (impressionId) {
+        const row = yield* db
+          .select()
+          .from(AdImpressionTable)
+          .where(eq(AdImpressionTable.id, impressionId))
+          .get()
+          .pipe(Effect.orDie)
+        if (!row) return null
+        return rowToImpression(row)
+      }),
+
+      markCredited: Effect.fn("AdStore.markCredited")(function* (impressionId) {
+        const impression = yield* db
+          .select()
+          .from(AdImpressionTable)
+          .where(eq(AdImpressionTable.id, impressionId))
+          .get()
+          .pipe(Effect.orDie)
+        if (!impression || impression.credited === 1) return false
+        yield* db
+          .update(AdImpressionTable)
+          .set({ credited: 1 })
+          .where(eq(AdImpressionTable.id, impressionId))
+          .run()
+          .pipe(Effect.orDie)
+        return true
+      }),
+
+      setImpressionShownAt: Effect.fn("AdStore.setImpressionShownAt")(function* (impressionId, shownAt) {
+        yield* db
+          .update(AdImpressionTable)
+          .set({ shown_at: shownAt })
+          .where(eq(AdImpressionTable.id, impressionId))
           .run()
           .pipe(Effect.orDie)
       }),
@@ -225,8 +282,8 @@ export const layer = Layer.effect(
           .where(eq(AdImpressionTable.id, impressionId))
           .get()
           .pipe(Effect.orDie)
-        // Unknown impression id: return false so the caller knows the click was not recorded.
-        if (!impression) return false
+        // Unknown or already-clicked impression: return false so the caller knows the click was not recorded.
+        if (!impression || impression.clicked === 1) return false
 
         yield* db
           .update(AdImpressionTable)
@@ -270,9 +327,70 @@ export const layer = Layer.effect(
         })
       }),
 
+      getTodayStats: Effect.fn("AdStore.getTodayStats")(function* (userId) {
+        const dayStart = new Date(new Date().setHours(0, 0, 0, 0)).getTime()
+        const impressions = yield* db
+          .select()
+          .from(AdImpressionTable)
+          .where(and(eq(AdImpressionTable.user_id, userId), gte(AdImpressionTable.shown_at, dayStart)))
+          .all()
+          .pipe(Effect.orDie)
+
+        const totalClicks = impressions.filter((i) => i.clicked === 1).length
+        const creditedViews = impressions.filter((i) => i.credited === 1).length
+        const creditsEarned = creditedViews * CREDITS_PER_VIEW + totalClicks * CREDITS_PER_CLICK
+
+        return new ImpressionStats({
+          total_ads: impressions.length,
+          total_clicks: totalClicks,
+          credits_earned: creditsEarned,
+        })
+      }),
+
       clearImpressions: Effect.fn("AdStore.clearImpressions")(function* () {
         yield* db.delete(AdImpressionTable).run().pipe(Effect.orDie)
         yield* db.delete(AdClickEventTable).run().pipe(Effect.orDie)
+      }),
+
+      getPreference: Effect.fn("AdStore.getPreference")(function* (userId) {
+        const row = yield* db
+          .select()
+          .from(CodefreePreferenceTable)
+          .where(eq(CodefreePreferenceTable.user_id, userId))
+          .get()
+          .pipe(Effect.orDie)
+        if (!row) return null
+        return {
+          enabled: row.enabled === 1,
+          categories: JSON.parse(row.categories) as string[],
+        }
+      }),
+
+      upsertPreference: Effect.fn("AdStore.upsertPreference")(function* (userId, enabled, categories) {
+        const now = Date.now()
+        const existing = yield* db
+          .select()
+          .from(CodefreePreferenceTable)
+          .where(eq(CodefreePreferenceTable.user_id, userId))
+          .get()
+          .pipe(Effect.orDie)
+        const payload = { enabled: enabled ? 1 : 0, categories: JSON.stringify(categories), time_updated: now }
+        if (existing) {
+          yield* db
+            .update(CodefreePreferenceTable)
+            .set(payload)
+            .where(eq(CodefreePreferenceTable.user_id, userId))
+            .run()
+            .pipe(Effect.orDie)
+        }
+        if (!existing) {
+          yield* db
+            .insert(CodefreePreferenceTable)
+            .values({ user_id: userId, ...payload, time_created: now })
+            .run()
+            .pipe(Effect.orDie)
+        }
+        return { enabled, categories }
       }),
     })
   }),
@@ -303,5 +421,21 @@ export const clearImpressions = Effect.fn("AdStore.clearImpressions")(function* 
   const svc = yield* StoreService
   yield* svc.clearImpressions()
 })
+
+function rowToImpression(row: typeof AdImpressionTable.$inferSelect): AdImpression {
+  return new AdImpression({
+    id: AdImpressionID.make(row.id),
+    ad_id: AdCreativeID.make(row.ad_id),
+    slot_type: row.slot_type as AdImpression["slot_type"],
+    session_id: row.session_id,
+    user_id: row.user_id,
+    shown_at: row.shown_at,
+    duration_ms: row.duration_ms,
+    clicked: row.clicked === 1,
+    click_url: row.click_url ?? undefined,
+    credited: row.credited === 1,
+    slot_min_ms: row.slot_min_ms,
+  })
+}
 
 export * as Ad from "."

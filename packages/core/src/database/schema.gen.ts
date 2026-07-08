@@ -77,7 +77,18 @@ export default {
           \`shown_at\` integer NOT NULL,
           \`duration_ms\` integer NOT NULL,
           \`clicked\` integer DEFAULT 0 NOT NULL,
-          \`click_url\` text
+          \`click_url\` text,
+          \`credited\` integer DEFAULT 0 NOT NULL,
+          \`slot_min_ms\` integer DEFAULT 8000 NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`codefree_preference\` (
+          \`user_id\` text PRIMARY KEY,
+          \`enabled\` integer DEFAULT 0 NOT NULL,
+          \`categories\` text DEFAULT '[]' NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
         );
       `)
       yield* tx.run(`

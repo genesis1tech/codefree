@@ -2,13 +2,14 @@ import path from "path"
 import { Effect, Context, Layer, Option, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Wallet } from "@opencode-ai/core/wallet"
-import { shouldShowAd, selectAd, formatAdAsMarkdown, trackImpression } from "@opencode-ai/core/ad/injector"
+import { shouldShowAd, selectAd, formatAdAsMarkdown, trackImpression, resetFrequencyCaps } from "@opencode-ai/core/ad/injector"
 import { Store as AdStore, AdSource } from "@opencode-ai/core/ad/service"
 import { AD_VIEW_CREDIT_REWARD, AFFILIATE_CLICK_CREDIT_REWARD } from "@opencode-ai/core/wallet/config"
+import { AdConfig } from "@opencode-ai/core/ad/types"
 import { ConfigCodefree } from "@opencode-ai/core/config/codefree"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Global } from "@opencode-ai/core/global"
-import { applyUsage as applyUsageCredits } from "@opencode-ai/core/codefree"
+import { applyUsage as applyUsageCredits, completeImpression as completeImpressionCredits, creditAdClick } from "@opencode-ai/core/codefree"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/layer-node-platform"
@@ -31,6 +32,15 @@ const AdImpressionEvent = EventV2.define({
     ad_id: Schema.String,
     slot_type: Schema.Literals(["thinking", "toolgap", "idle"]),
     session_id: Schema.String,
+    impression_id: Schema.String,
+    slot_min_ms: Schema.Number,
+    headline: Schema.String,
+    body: Schema.String,
+    cta_text: Schema.String,
+    cta_url: Schema.String,
+    display_url: Schema.String,
+    advertiser_id: Schema.String,
+    category: Schema.String,
   },
 })
 
@@ -66,6 +76,7 @@ if (!hourlyResetTimer) {
     for (const key of Object.keys(adCountsThisHour)) {
       delete adCountsThisHour[key]
     }
+    resetFrequencyCaps()
   }, msUntilNextHour)
   hourlyResetTimer.unref()
 }
@@ -109,6 +120,11 @@ export interface Interface {
     clickURL: string,
     adHeadline?: string,
   ) => Effect.Effect<void>
+  readonly completeImpression: (
+    sessionID: SessionID,
+    impressionID: string,
+    adHeadline?: string,
+  ) => Effect.Effect<{ credited: boolean; reason?: string; balance_credits?: number }>
   // Boot/session-start hydration: reads the resolved user's persisted wallet balance and emits a
   // single codefree.credit.updated event so the TUI footer reconciles to the persisted balance on
   // restart (not 0). Fire-and-forget from the processor — never breaks the session (VAL-TUI-025).
@@ -139,7 +155,17 @@ export const layer = Layer.effect(
     // behavior (VAL-SESSION-008/041).
     const readAdConfig = Effect.fnUntraced(function* () {
       const info = yield* config.get()
-      return ConfigCodefree.toAdConfig(info.codefree)
+      const base = ConfigCodefree.toAdConfig(info.codefree)
+      const userID = yield* resolveUserID()
+      const pref = yield* adStore.getPreference(userID).pipe(Effect.catch(() => Effect.succeed(null)))
+      if (!pref) return base
+      return Schema.decodeUnknownSync(AdConfig)({
+        enabled: pref.enabled,
+        min_interval_ms: base.min_interval_ms,
+        max_ads_per_hour: base.max_ads_per_hour,
+        categories: pref.categories,
+        frequency_cap: base.frequency_cap,
+      })
     })
 
     // Read the ad server URL from the codefree config block. Unset => local placeholders (Phase 0).
@@ -147,6 +173,18 @@ export const layer = Layer.effect(
       const info = yield* config.get()
       return info.codefree?.ad_server_url
     })
+
+    const reportUpstream = (adServerUrl: string, path: string, body: Record<string, unknown>) =>
+      Effect.tryPromise({
+        try: () =>
+          fetch(`${adServerUrl}${path}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(5000),
+          }),
+        catch: () => new Error("upstream report failed"),
+      }).pipe(Effect.catch(() => Effect.void))
 
     // Resolve the user id used for impression attribution and wallet crediting. A remote account
     // takes precedence; otherwise a stable local user id is persisted in the opencode global data
@@ -193,7 +231,7 @@ export const layer = Layer.effect(
         if (!shouldShowAd(slotType, lastAdTime, countThisHour, adConfig)) return
 
         const adServerUrl = yield* readAdServerURL()
-        const availableAds = yield* adSource.fetchAds(adServerUrl)
+        const availableAds = yield* adSource.fetchAds(adServerUrl, slotType, adConfig.categories)
         const ad = selectAd(slotType, adConfig.categories, availableAds, adConfig)
         // No eligible ad => no side effects (VAL-SESSION-014).
         if (!ad) return
@@ -221,34 +259,35 @@ export const layer = Layer.effect(
             slotType,
             sessionID,
             userID ?? "anonymous",
-            Date.now() - lastAdTime,
+            0,
           )
           yield* adStore.recordImpression(impression)
 
-          // The ad was shown: emit the impression event (amount is the standardized view reward).
+          if (adServerUrl) {
+            yield* reportUpstream(adServerUrl, "/impressions", {
+              impression_id: impression.id,
+              ad_id: impression.ad_id,
+              user_id: userID ?? "anonymous",
+              slot_type: slotType,
+              created_at: impression.shown_at,
+            })
+          }
+
           yield* events.publish(AdImpressionEvent, {
             amount: AD_VIEW_CREDIT_REWARD,
             ad_id: impression.ad_id,
             slot_type: slotType,
             session_id: sessionID,
+            impression_id: impression.id,
+            slot_min_ms: impression.slot_min_ms,
+            headline: ad.headline,
+            body: ad.body,
+            cta_text: ad.cta_text,
+            cta_url: ad.cta_url,
+            display_url: ad.display_url,
+            advertiser_id: ad.advertiser_id,
+            category: ad.category,
           })
-
-          // Credit the resolved user's wallet (remote account or stable local id) and emit the
-          // credit.updated event reflecting the new balance.
-          if (userID) {
-            const credited = yield* wallet.creditWallet(
-              userID,
-              AD_VIEW_CREDIT_REWARD,
-              "ad_view",
-              `Ad view credit: ${ad.headline}`,
-              impression.id,
-            )
-            yield* events.publish(CreditUpdatedEvent, {
-              balance_credits: credited.balanceCredits,
-              lifetime_earned: credited.lifetimeEarnedCredits,
-              lifetime_spent: credited.lifetimeSpentCredits,
-            })
-          }
         }).pipe(
           Effect.catchDefect((defect) =>
             Effect.logWarning("CodeFree: ad side-effects defect (non-breaking)", defect),
@@ -322,6 +361,19 @@ export const layer = Layer.effect(
           // Unknown impression id: the click was not recorded, so do not credit or emit.
           if (!recorded) return
 
+          const adServerUrl = yield* readAdServerURL()
+          if (adServerUrl) {
+            const impression = yield* adStore.getImpression(impressionID)
+            if (impression) {
+              yield* reportUpstream(adServerUrl, "/clicks", {
+                impression_id: impressionID,
+                ad_id: impression.ad_id,
+                user_id: userID ?? "anonymous",
+                click_url: clickURL,
+              })
+            }
+          }
+
           yield* events.publish(AdClickEvent, {
             amount: AFFILIATE_CLICK_CREDIT_REWARD,
             ad_id: impressionID,
@@ -330,13 +382,11 @@ export const layer = Layer.effect(
           })
 
           if (userID) {
-            const credited = yield* wallet.creditWallet(
-              userID,
-              AFFILIATE_CLICK_CREDIT_REWARD,
-              "affiliate_click",
-              `Ad click credit: ${adHeadline}`,
-              impressionID,
+            const result = yield* creditAdClick(userID, impressionID, adHeadline).pipe(
+              Effect.provideService(Wallet.Service, wallet),
             )
+            if (!result.credited) return
+            const credited = yield* wallet.getBalance(userID)
             yield* events.publish(CreditUpdatedEvent, {
               balance_credits: credited.balanceCredits,
               lifetime_earned: credited.lifetimeEarnedCredits,
@@ -351,6 +401,50 @@ export const layer = Layer.effect(
             Effect.logWarning("CodeFree: click side-effects failed (persist/credit/event)", err),
           ),
         )
+      }),
+
+      completeImpression: Effect.fn("CodeFree.completeImpression")(function* (
+        _sessionID: SessionID,
+        impressionID: string,
+        adHeadline = "Ad view",
+      ) {
+        const userID = yield* resolveUserID()
+        if (!userID) return { credited: false, reason: "unknown" }
+
+        const result = yield* Effect.gen(function* () {
+          const completed = yield* completeImpressionCredits(userID, impressionID, adHeadline).pipe(
+            Effect.provideService(Wallet.Service, wallet),
+            Effect.provideService(AdStore.Service, adStore),
+          )
+          if (!completed.credited) return completed
+
+          const balance = yield* wallet.getBalance(userID)
+          yield* events.publish(CreditUpdatedEvent, {
+            balance_credits: balance.balanceCredits,
+            lifetime_earned: balance.lifetimeEarnedCredits,
+            lifetime_spent: balance.lifetimeSpentCredits,
+          })
+          return completed
+        }).pipe(
+          Effect.catchDefect((defect) =>
+            Effect.andThen(
+              Effect.logWarning("CodeFree: complete impression defect (non-breaking)", defect),
+              () => Effect.succeed({ credited: false, reason: "error" }),
+            ),
+          ),
+          Effect.catch((err) =>
+            Effect.andThen(
+              Effect.logWarning("CodeFree: complete impression failed", err),
+              () => Effect.succeed({ credited: false, reason: "error" }),
+            ),
+          ),
+        )
+
+        return {
+          credited: result.credited,
+          reason: result.reason,
+          balance_credits: result.balance_credits,
+        }
       }),
 
       hydrateWallet: Effect.fn("CodeFree.hydrateWallet")(function* (_sessionID: SessionID) {
@@ -442,6 +536,38 @@ export const clickAd = Effect.fn("CodeFree.clickAd")(function* (
 ) {
   const svc = yield* Service
   yield* svc.clickAd(sessionID, impressionID, clickURL, adHeadline)
+})
+
+export const completeImpression = Effect.fn("CodeFree.completeImpression")(function* (
+  sessionID: SessionID,
+  impressionID: string,
+  adHeadline?: string,
+) {
+  const svc = yield* Service
+  return yield* svc.completeImpression(sessionID, impressionID, adHeadline)
+})
+
+export const resolveUserID = Effect.fn("CodeFree.resolveUserID")(function* () {
+  const account = yield* Account.Service
+  const global = yield* Global.Service
+  const idPath = path.join(global.data, "codefree_local_user_id")
+  const file = Bun.file(idPath)
+  const exists = yield* Effect.promise(() => file.exists())
+  const readLocal = Effect.gen(function* () {
+    if (!exists) {
+      const id = `cfu_${crypto.randomUUID()}`
+      yield* Effect.promise(() => Bun.write(idPath, id))
+      return id
+    }
+    const text = (yield* Effect.promise(() => file.text())).trim()
+    if (text) return text
+    const id = `cfu_${crypto.randomUUID()}`
+    yield* Effect.promise(() => Bun.write(idPath, id))
+    return id
+  })
+  const opt = yield* account.active().pipe(Effect.catch(() => Effect.succeed(Option.none<Account.Info>())))
+  if (Option.isSome(opt)) return opt.value.id
+  return yield* readLocal
 })
 
 export * as CodeFree from "./codefree"
