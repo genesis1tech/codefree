@@ -2,7 +2,11 @@ import { describe, expect, it } from "bun:test"
 import { Effect, Layer } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { Wallet } from "@opencode-ai/core/wallet"
-import { AD_VIEW_CREDIT_REWARD, AFFILIATE_CLICK_CREDIT_REWARD, CREDIT_USD_VALUE } from "@opencode-ai/core/wallet/config"
+import { AD_VIEW_CREDIT_REWARD, AFFILIATE_CLICK_CREDIT_REWARD, CREDIT_USD_VALUE, MAX_DAILY_CREDITS } from "@opencode-ai/core/wallet/config"
+import { Store, recordImpression } from "@opencode-ai/core/ad/service"
+import { trackImpression } from "@opencode-ai/core/ad/injector"
+import { AdCreative, AdCreativeID, AdvertiserID } from "@opencode-ai/core/ad/types"
+import { completeImpression } from "@opencode-ai/core/codefree"
 import { testEffect } from "./lib/effect"
 
 // In-memory database provisioned with the wallet tables via the fresh-DB schema snapshot.
@@ -309,6 +313,44 @@ describe("service Interface error channels (VAL-WALLET-020)", () => {
 
       const balanceErr = yield* failureOf(service.getBalance("user-errchan-missing"))
       expect(balanceErr).toBeInstanceOf(Wallet.WalletNotFoundError)
+    }),
+  )
+})
+
+const walletStoreLayer = Layer.mergeAll(Wallet.layer, Store.layer).pipe(Layer.provide(database))
+const effWalletStore = testEffect(walletStoreLayer)
+
+describe("daily cap (VAL-WALLET-021)", () => {
+  effWalletStore.effect("blocks credit when earnedToday + reward exceeds MAX_DAILY_CREDITS", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const store = yield* Store.Service
+      const userId = "user-daily-cap"
+      yield* wallet.creditWallet(userId, MAX_DAILY_CREDITS - 3, "ad_view", "seed near cap")
+
+      const impression = trackImpression(
+        new AdCreative({
+          id: AdCreativeID.make("ad-cap-1"),
+          advertiser_id: AdvertiserID.make("adv-cap"),
+          headline: "Cap test",
+          body: "Body",
+          cta_text: "Go",
+          cta_url: "https://example.com",
+          display_url: "example.com",
+          category: "devtool",
+          format: "markdown",
+        }),
+        "toolgap",
+        "ses-cap",
+        userId,
+        0,
+      )
+      yield* recordImpression(impression)
+      yield* store.setImpressionShownAt(impression.id, Date.now() - 10_000)
+
+      const result = yield* completeImpression(userId, impression.id)
+      expect(result.credited).toBe(false)
+      expect(result.reason).toBe("daily_cap")
     }),
   )
 })

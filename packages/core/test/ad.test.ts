@@ -415,6 +415,34 @@ describe("Ad Engine", () => {
     }))
   })
 
+  describe("dwell trust columns (VAL-AD-028/029)", () => {
+    eff.effect("recordImpression stores credited=0 and slot_min_ms (VAL-AD-028)", Effect.gen(function* () {
+      yield* clearImpressions()
+      const ad = makeAd("trust-1", "trust-adv", "devtool")
+      const impression = trackImpression(ad, "toolgap", "ses-trust", "usr-trust", 0)
+      yield* recordImpression(impression)
+
+      const store = yield* Store.Service
+      const stored = yield* store.getImpression(impression.id)
+      expect(stored).not.toBeNull()
+      expect(stored!.credited).toBe(false)
+      expect(stored!.slot_min_ms).toBe(1000)
+    }))
+
+    eff.effect("markCredited flips credited once (VAL-AD-029)", Effect.gen(function* () {
+      yield* clearImpressions()
+      const ad = makeAd("trust-2", "trust-adv", "devtool")
+      const impression = trackImpression(ad, "toolgap", "ses-trust2", "usr-trust2", 0)
+      yield* recordImpression(impression)
+
+      const store = yield* Store.Service
+      expect(yield* store.markCredited(impression.id)).toBe(true)
+      expect(yield* store.markCredited(impression.id)).toBe(false)
+      const stored = yield* store.getImpression(impression.id)
+      expect(stored!.credited).toBe(true)
+    }))
+  })
+
   describe("schema validation", () => {
     it("placeholder ads have valid branded IDs and validate against AdCreative", () => {
       const ads = fetchAds(makeConfig())

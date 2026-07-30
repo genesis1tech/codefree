@@ -55,6 +55,8 @@ export class AdImpression extends Schema.Class<AdImpression>("AdImpression")({
   duration_ms: Schema.Number,
   clicked: Schema.Boolean,
   click_url: Schema.optional(Schema.String),
+  credited: Schema.Boolean,
+  slot_min_ms: Schema.Number,
 }) {}
 
 export class AdConfig extends Schema.Class<AdConfig>("AdConfig")({

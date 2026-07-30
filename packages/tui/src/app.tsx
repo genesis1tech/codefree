@@ -33,6 +33,7 @@ import { EditorContextProvider } from "./context/editor"
 import { useEvent } from "./context/event"
 import { SDKProvider, useSDK } from "./context/sdk"
 import { WalletProvider } from "./context/wallet"
+import { AdProvider } from "./context/ad"
 import { StartupLoading } from "./component/startup-loading"
 import { SyncProvider, useSync } from "./context/sync"
 import { DataProvider } from "./context/data"
@@ -294,6 +295,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                                           events={input.events}
                                         >
                                           <WalletProvider>
+                                          <AdProvider>
                                           <ProjectProvider>
                                             <SyncProvider>
                                               <DataProvider>
@@ -320,6 +322,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                                               </DataProvider>
                                             </SyncProvider>
                                           </ProjectProvider>
+                                          </AdProvider>
                                         </WalletProvider>
                                       </SDKProvider>
                                     </PluginRuntimeProvider>

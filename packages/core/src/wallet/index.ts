@@ -1,4 +1,4 @@
-import { desc, eq, sql } from "drizzle-orm"
+import { desc, eq, sql, and, gte } from "drizzle-orm"
 import { Context, Effect, Layer, Schema } from "effect"
 import { Database } from "../database/database"
 import { CREDIT_USD_VALUE } from "./config"
@@ -138,6 +138,7 @@ export interface Interface {
     limit?: number,
     offset?: number,
   ) => Effect.Effect<TransactionInfo[]>
+  readonly getEarnedToday: (userId: string) => Effect.Effect<number>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Wallet") {}
@@ -283,6 +284,24 @@ export const layer = Layer.effect(
           .offset(offset)
           .all()
           .pipe(Effect.orDie)).map(rowToTransactionInfo)
+      }),
+
+      getEarnedToday: Effect.fn("Wallet.getEarnedToday")(function* (userId) {
+        const wallet = yield* findWalletByUser(userId)
+        if (!wallet) return 0
+        const dayStart = new Date(new Date().setHours(0, 0, 0, 0)).getTime()
+        const rows = yield* db
+          .select()
+          .from(WalletTransactionTable)
+          .where(
+            and(eq(WalletTransactionTable.wallet_id, wallet.id), gte(WalletTransactionTable.time_created, dayStart)),
+          )
+          .all()
+          .pipe(Effect.orDie)
+        return rows
+          .filter((row) => row.type === "ad_view" || row.type === "affiliate_click")
+          .filter((row) => row.amount_credits > 0)
+          .reduce((sum, row) => sum + row.amount_credits, 0)
       }),
     })
   }),

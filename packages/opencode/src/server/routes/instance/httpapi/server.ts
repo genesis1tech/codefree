@@ -49,6 +49,9 @@ import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
 import { Worktree } from "@/worktree"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { Store as AdStore } from "@opencode-ai/core/ad/service"
+import { Global } from "@opencode-ai/core/global"
+import { Wallet, Payout } from "@opencode-ai/core/wallet"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -77,6 +80,7 @@ import {
 import { EventApi } from "./groups/event"
 import { PtyConnectApi } from "./groups/pty"
 import { eventHandlers } from "./handlers/event"
+import { codefreeHandlers } from "./handlers/codefree"
 import { configHandlers } from "./handlers/config"
 import { controlHandlers } from "./handlers/control"
 import { controlPlaneHandlers } from "./handlers/control-plane"
@@ -144,6 +148,7 @@ const ptyConnectApiRoutes = HttpApiBuilder.layer(PtyConnectApi).pipe(
 )
 const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
   Layer.provide([
+    codefreeHandlers,
     configHandlers,
     experimentalHandlers,
     fileHandlers,
@@ -204,6 +209,10 @@ const app = LayerNode.group([
   Npm.node,
   FSUtil.node,
   Database.node,
+  Global.node,
+  LayerNode.make(Wallet.layer, [Database.node]),
+  LayerNode.make(AdStore.layer, [Database.node]),
+  LayerNode.make(Payout.layer, [Database.node]),
   Auth.node,
   Account.node,
   Config.node,

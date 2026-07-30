@@ -31,7 +31,7 @@ export type PayoutAccountID = typeof PayoutAccountID.Type
 export const WithdrawalStatus = Schema.Literals(WithdrawalStatusValues)
 export type WithdrawalStatus = typeof WithdrawalStatus.Type
 
-export const PayoutMethod = Schema.Literals(["manual", "stripe", "paypal"])
+export const PayoutMethod = Schema.Literals(["manual", "stripe", "paypal", "gateway"])
 export type PayoutMethod = typeof PayoutMethod.Type
 
 export class WithdrawalRequest extends Schema.Class<WithdrawalRequest>("Wallet.WithdrawalRequest")({

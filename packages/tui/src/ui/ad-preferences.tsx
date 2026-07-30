@@ -1,8 +1,9 @@
-import { Show, For, createSignal } from "solid-js"
+import { Show, For, createSignal, onMount } from "solid-js"
 import { TextAttributes } from "@opentui/core"
 import { useTheme } from "../context/theme"
 import { useKV } from "../context/kv"
 import { useBindings } from "../keymap"
+import { useSDK } from "../context/sdk"
 
 export type AdPreferencesProps = {
   dailySummary?: {
@@ -21,7 +22,14 @@ export type AdPreferencesState = {
 
 const KV_ADS_ENABLED = "codefree_ads_enabled"
 const KV_AD_CATEGORIES = "codefree_ad_categories"
-const DEFAULT_CATEGORIES = ["devtools", "cloud", "education", "productivity", "open_source"]
+const ENGINE_CATEGORIES = [
+  { value: "devtool", label: "Dev tools" },
+  { value: "saas", label: "SaaS & cloud" },
+  { value: "recruiting", label: "Recruiting" },
+  { value: "education", label: "Education" },
+  { value: "affiliate", label: "Affiliate offers" },
+] as const
+const DEFAULT_CATEGORIES = ENGINE_CATEGORIES.map((item) => item.value)
 
 function toggleArrayItem(current: string[], item: string) {
   return current.includes(item) ? current.filter((c) => c !== item) : [...current, item]
@@ -30,17 +38,34 @@ function toggleArrayItem(current: string[], item: string) {
 export function AdPreferences(props: AdPreferencesProps) {
   const { theme } = useTheme()
   const kv = useKV()
+  const sdk = useSDK()
 
   const [adsEnabled, setAdsEnabled] = createSignal(kv.get(KV_ADS_ENABLED, false))
-  const categories = () => (props.availableCategories ?? DEFAULT_CATEGORIES)
+  const categories = () =>
+    (props.availableCategories ?? DEFAULT_CATEGORIES).filter((category) =>
+      DEFAULT_CATEGORIES.includes(category as (typeof DEFAULT_CATEGORIES)[number]),
+    )
   const [allowedCategories, setAllowedCategories] = createSignal<string[]>(
-    kv.get(KV_AD_CATEGORIES, categories()),
+    kv.get(KV_AD_CATEGORIES, categories()).filter((category: string) =>
+      DEFAULT_CATEGORIES.includes(category as (typeof DEFAULT_CATEGORIES)[number]),
+    ),
   )
+
+  function syncPreferences(nextEnabled: boolean, nextCategories: string[]) {
+    const directory = sdk.directory
+    const suffix = directory ? `?directory=${encodeURIComponent(directory)}` : ""
+    void fetch(`${sdk.url}/codefree/preferences${suffix}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: nextEnabled, categories: nextCategories }),
+    }).catch(() => {})
+  }
 
   function toggleAds() {
     const next = !adsEnabled()
     setAdsEnabled(next)
     kv.set(KV_ADS_ENABLED, next)
+    syncPreferences(next, allowedCategories())
     props.onChange?.({ adsEnabled: next, allowedCategories: allowedCategories() })
   }
 
@@ -48,8 +73,23 @@ export function AdPreferences(props: AdPreferencesProps) {
     const next = toggleArrayItem(allowedCategories(), category)
     setAllowedCategories(next)
     kv.set(KV_AD_CATEGORIES, next)
+    syncPreferences(adsEnabled(), next)
     props.onChange?.({ adsEnabled: adsEnabled(), allowedCategories: next })
   }
+
+  onMount(() => {
+    const directory = sdk.directory
+    const suffix = directory ? `?directory=${encodeURIComponent(directory)}` : ""
+    void fetch(`${sdk.url}/codefree/wallet/summary${suffix}`)
+      .then((response) => response.json())
+      .then((summary: { enabled?: boolean; categories?: string[] }) => {
+        if (typeof summary.enabled === "boolean") {
+          setAdsEnabled(summary.enabled)
+          kv.set(KV_ADS_ENABLED, summary.enabled)
+        }
+      })
+      .catch(() => {})
+  })
 
   useBindings(() => ({
     bindings: [
@@ -112,9 +152,9 @@ export function AdPreferences(props: AdPreferencesProps) {
       <Show when={adsEnabled()}>
         <box gap={1} paddingTop={1}>
           <text fg={theme.textMuted}>Categories</text>
-          <For each={categories()}>
+          <For each={ENGINE_CATEGORIES}>
             {(category) => {
-              const active = () => allowedCategories().includes(category)
+              const active = () => allowedCategories().includes(category.value)
               return (
                 <box
                   flexDirection="row"
@@ -122,13 +162,13 @@ export function AdPreferences(props: AdPreferencesProps) {
                   paddingLeft={1}
                   paddingRight={1}
                   backgroundColor={active() ? theme.backgroundPanel : undefined}
-                  onMouseUp={() => toggleCategory(category)}
+                  onMouseUp={() => toggleCategory(category.value)}
                 >
                   <text fg={active() ? theme.success : theme.textMuted}>
                     {active() ? "✓" : "○"}
                   </text>
                   <text fg={active() ? theme.text : theme.textMuted}>
-                    {category}
+                    {category.label}
                   </text>
                 </box>
               )

@@ -9,7 +9,7 @@ export const CREDIT_USD_VALUE = 0.01
 
 export type WithdrawPanelProps = {
   /** Called when the user triggers a withdrawal. The TUI layer wires this to the server route. */
-  onRequestWithdraw?: (amountCredits: number) => void
+  onRequestWithdraw?: (amountCredits: number) => Promise<{ status: string; message?: string } | void>
 }
 
 export function WithdrawPanel(props: WithdrawPanelProps) {
@@ -27,14 +27,39 @@ export function WithdrawPanel(props: WithdrawPanelProps) {
 
   function handleWithdraw() {
     if (!canWithdraw()) return
-    setStatus(`Withdrawing ${withdrawable()} credits (${formatUsd(withdrawable())})...`)
-    props.onRequestWithdraw?.(withdrawable())
+    const amount = withdrawable()
+    setStatus(`Redeeming ${amount} credits (${formatUsd(amount)})...`)
+    const result = props.onRequestWithdraw?.(amount)
+    if (!result || typeof (result as Promise<unknown>).then !== "function") return
+    void (result as Promise<{ status: string; message?: string }>).then((response) => {
+      if (response.status === "completed") {
+        setStatus(`Redeemed ${formatUsd(amount)} to your gateway balance`)
+        return
+      }
+      if (response.status === "failed") {
+        setStatus("Redemption failed — credits refunded")
+        return
+      }
+      if (response.status === "below_minimum") {
+        setStatus(`Minimum redemption is ${MIN_WITHDRAWAL_CREDITS} credits`)
+        return
+      }
+      if (response.status === "insufficient") {
+        setStatus("Insufficient balance for redemption")
+        return
+      }
+      if (response.status === "unavailable") {
+        setStatus(response.message ?? "Gateway not configured")
+        return
+      }
+      setStatus(response.message ?? response.status)
+    })
   }
 
   return (
     <box paddingLeft={2} paddingRight={2} gap={1}>
       <text fg={theme.text} attributes={TextAttributes.BOLD}>
-        Cash Out
+        Redeem for API tokens
       </text>
 
       {/* Balance summary */}
@@ -84,7 +109,7 @@ export function WithdrawPanel(props: WithdrawPanelProps) {
             onMouseUp={handleWithdraw}
           >
             <text fg={theme.selectedListItemText} attributes={TextAttributes.BOLD}>
-              Withdraw all ({withdrawable().toLocaleString()} credits)
+              Redeem all ({withdrawable().toLocaleString()} credits)
             </text>
           </box>
         </box>

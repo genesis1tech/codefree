@@ -22,8 +22,10 @@ export type AdBannerProps = {
   ad: AdData
   placement: AdPlacement
   visible: boolean
+  durationMs?: number
   onDismiss?: (adId: string) => void
   onClick?: (adId: string) => void
+  onCreditTimer?: (adId: string) => void
 }
 
 const DEFAULT_DURATIONS: Record<AdPlacement, number> = {
@@ -43,15 +45,21 @@ export function AdBanner(props: AdBannerProps) {
 
   const [dismissed, setDismissed] = createSignal(false)
 
-  const duration = () => DEFAULT_DURATIONS[props.placement]
+  const duration = () => props.durationMs ?? DEFAULT_DURATIONS[props.placement]
 
-  // Auto-dismiss after configurable duration
+  // Auto-dismiss after configurable duration; fire credit timer at slot minimum dwell.
   createEffect(() => {
     if (!props.visible || dismissed()) return
-    const handle = setTimeout(() => {
-      handleDismiss()
+    const creditHandle = setTimeout(() => {
+      if (!dismissed()) props.onCreditTimer?.(props.ad.id)
     }, duration()).unref()
-    onCleanup(() => clearTimeout(handle))
+    const dismissHandle = setTimeout(() => {
+      handleDismiss()
+    }, duration() + 4000).unref()
+    onCleanup(() => {
+      clearTimeout(creditHandle)
+      clearTimeout(dismissHandle)
+    })
   })
 
   function handleDismiss() {
@@ -61,7 +69,6 @@ export function AdBanner(props: AdBannerProps) {
 
   function handleClick() {
     props.onClick?.(props.ad.id)
-    // Try opening in browser first; fall back to clipboard
     open(props.ad.url).catch(() => {
       if (!clipboard.write) return
       clipboard

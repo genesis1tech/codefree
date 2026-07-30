@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "d3af21de-2f94-478a-9a84-fb67cc75298b",
+  "id": "01a22ef9-e1d7-4847-ab2e-4057924b8042",
   "prevIds": [
-    "169a0f0f-d58f-479f-b024-fa1c7b9a09db"
+    "d3af21de-2f94-478a-9a84-fb67cc75298b"
   ],
   "ddl": [
     {
@@ -32,6 +32,10 @@
     },
     {
       "name": "ad_impression",
+      "entityType": "tables"
+    },
+    {
+      "name": "codefree_preference",
       "entityType": "tables"
     },
     {
@@ -555,6 +559,76 @@
       "name": "click_url",
       "entityType": "columns",
       "table": "ad_impression"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "credited",
+      "entityType": "columns",
+      "table": "ad_impression"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "8000",
+      "generated": null,
+      "name": "slot_min_ms",
+      "entityType": "columns",
+      "table": "ad_impression"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_id",
+      "entityType": "columns",
+      "table": "codefree_preference"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "enabled",
+      "entityType": "columns",
+      "table": "codefree_preference"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'[]'",
+      "generated": null,
+      "name": "categories",
+      "entityType": "columns",
+      "table": "codefree_preference"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "codefree_preference"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "codefree_preference"
     },
     {
       "type": "text",
@@ -2363,6 +2437,15 @@
       "nameExplicit": false,
       "name": "ad_impression_pk",
       "table": "ad_impression",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "user_id"
+      ],
+      "nameExplicit": false,
+      "name": "codefree_preference_pk",
+      "table": "codefree_preference",
       "entityType": "pks"
     },
     {

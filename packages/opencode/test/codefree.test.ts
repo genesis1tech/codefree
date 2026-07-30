@@ -16,7 +16,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { getImpressionStats, Store, fetchAds, AdSource } from "@opencode-ai/core/ad/service"
 import { trackImpression } from "@opencode-ai/core/ad/injector"
-import { AD_VIEW_CREDIT_REWARD, AFFILIATE_CLICK_CREDIT_REWARD } from "@opencode-ai/core/wallet/config"
+import { AD_VIEW_CREDIT_REWARD, AFFILIATE_CLICK_CREDIT_REWARD, MAX_DAILY_CREDITS } from "@opencode-ai/core/wallet/config"
 import { Config } from "@/config/config"
 import { Account } from "@/account/account"
 import { CodeFree } from "@/session/codefree"
@@ -137,6 +137,40 @@ function collectCodefreeEvents<R>(run: Effect.Effect<void, never, R>) {
   })
 }
 
+function backdateImpression(impressionId: string) {
+  return Effect.gen(function* () {
+    const store = yield* Store.Service
+    yield* store.setImpressionShownAt(impressionId, Date.now() - 10_000)
+  })
+}
+
+function showAdAndComplete<R>(
+  sid: SessionV2.ID,
+  messageID: SessionV1.MessageID,
+  slot: "thinking" | "toolgap" | "idle",
+  publishPart: (part: SessionV1.TextPart) => Effect.Effect<SessionV1.TextPart>,
+) {
+  return Effect.gen(function* () {
+    const seen: Array<{ type: string; properties: Record<string, unknown> }> = []
+    const handler = (evt: { payload?: { type?: string; properties?: Record<string, unknown> } }) => {
+      const type = evt.payload?.type
+      if (typeof type === "string" && type.startsWith("codefree.")) {
+        seen.push({ type, properties: evt.payload!.properties! })
+      }
+    }
+    GlobalBus.on("event", handler)
+    yield* CodeFree.maybeShowAd(sid, messageID, slot, publishPart)
+    const impression = seen.find((event) => event.type === "codefree.ad.impression")
+    const impressionId = impression?.properties.impression_id
+    if (typeof impressionId === "string") {
+      yield* backdateImpression(impressionId)
+      yield* CodeFree.completeImpression(sid, impressionId)
+    }
+    GlobalBus.off("event", handler)
+    return seen
+  }) as Effect.Effect<Array<{ type: string; properties: Record<string, unknown> }>, never, R>
+}
+
 // --- Scenario runners (one testEffect per distinct layer configuration) ---
 
 const effEnabled = testEffect(buildLayer({ account: activeAccount, config: enabledConfig }))
@@ -213,10 +247,10 @@ describe("CodeFree namespace accessors delegate to the Service (VAL-SESSION-036)
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
       const sid = sessionID("acc_credit")
-      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_acc_credit"), "toolgap", (p) => Effect.succeed(p))
+      yield* showAdAndComplete(sid, SessionV1.MessageID.make("msg_acc_credit"), "toolgap", (p) => Effect.succeed(p))
       const balance = yield* wallet.getBalance(TEST_USER_ID)
-      expect(balance.balanceCredits).toBe(4)
-      expect(balance.lifetimeEarnedCredits).toBe(4)
+      expect(balance.balanceCredits).toBe(AD_VIEW_CREDIT_REWARD)
+      expect(balance.lifetimeEarnedCredits).toBe(AD_VIEW_CREDIT_REWARD)
     }),
   )
 
@@ -258,9 +292,9 @@ describe("CodeFree layer provides all deps with external Database (VAL-SESSION-0
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
       const sid = sessionID("deps_maybe")
-      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_deps_maybe"), "toolgap", (p) => Effect.succeed(p))
+      yield* showAdAndComplete(sid, SessionV1.MessageID.make("msg_deps_maybe"), "toolgap", (p) => Effect.succeed(p))
       const balance = yield* wallet.getBalance(TEST_USER_ID)
-      expect(balance.balanceCredits).toBe(4)
+      expect(balance.balanceCredits).toBe(AD_VIEW_CREDIT_REWARD)
     }),
   )
 })
@@ -299,21 +333,24 @@ describe("maybeShowAd happy path (VAL-SESSION-001/002/003/006)", () => {
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
       const sid = sessionID("hp_credit")
-      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_hp_credit"), "toolgap", (p) => Effect.succeed(p))
+      yield* showAdAndComplete(sid, SessionV1.MessageID.make("msg_hp_credit"), "toolgap", (p) => Effect.succeed(p))
       const balance = yield* wallet.getBalance(TEST_USER_ID)
-      expect(balance.balanceCredits).toBe(4)
+      expect(balance.balanceCredits).toBe(AD_VIEW_CREDIT_REWARD)
       const history = yield* wallet.getTransactionHistory(TEST_USER_ID)
       const adView = history.find((t) => t.type === "ad_view")
       expect(adView).toBeDefined()
-      expect(adView!.amountCredits).toBe(4)
+      expect(adView!.amountCredits).toBe(AD_VIEW_CREDIT_REWARD)
     }),
   )
 
-  effEnabled.effect("emits both codefree events exactly once per ad (VAL-SESSION-006)", () =>
+  effEnabled.effect("emits impression on show and credit.updated after completion (VAL-SESSION-006)", () =>
     Effect.gen(function* () {
       const sid = sessionID("hp_events")
-      const events = yield* collectCodefreeEvents(
-        CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_hp_events"), "toolgap", (p) => Effect.succeed(p)),
+      const events = yield* showAdAndComplete(
+        sid,
+        SessionV1.MessageID.make("msg_hp_events"),
+        "toolgap",
+        (p) => Effect.succeed(p),
       )
       const impressions = events.filter((e) => e.type === "codefree.ad.impression")
       const credits = events.filter((e) => e.type === "codefree.credit.updated")
@@ -346,8 +383,11 @@ describe("event payloads and ephemerality (VAL-SESSION-026/027/028)", () => {
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
       const sid = sessionID("shape_cred")
-      const events = yield* collectCodefreeEvents(
-        CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_shape_cred"), "toolgap", (p) => Effect.succeed(p)),
+      const events = yield* showAdAndComplete(
+        sid,
+        SessionV1.MessageID.make("msg_shape_cred"),
+        "toolgap",
+        (p) => Effect.succeed(p),
       )
       const cred = events.find((e) => e.type === "codefree.credit.updated")!
       const balance = yield* wallet.getBalance(TEST_USER_ID)
@@ -371,14 +411,12 @@ describe("events reach the GlobalBus via the bridge (VAL-SESSION-040)", () => {
   effEnabled.effect("a bus subscriber receives both event types with correct properties", () =>
     Effect.gen(function* () {
       const sid = sessionID("bus")
-      const events = yield* collectCodefreeEvents(
-        CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_bus"), "toolgap", (p) => Effect.succeed(p)),
-      )
+      const events = yield* showAdAndComplete(sid, SessionV1.MessageID.make("msg_bus"), "toolgap", (p) => Effect.succeed(p))
       const imp = events.find((e) => e.type === "codefree.ad.impression")
       const cred = events.find((e) => e.type === "codefree.credit.updated")
       expect(imp).toBeDefined()
       expect(cred).toBeDefined()
-      expect(imp!.properties.amount).toBe(4)
+      expect(imp!.properties.amount).toBe(AD_VIEW_CREDIT_REWARD)
       expect(typeof cred!.properties.balance_credits).toBe("number")
     }),
   )
@@ -550,13 +588,12 @@ describe("stable local user id (VAL-SESSION-022/023/024)", () => {
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
       const sid = sessionID("local_credit")
-      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_local_credit"), "toolgap", (p) => Effect.succeed(p))
-      // The resolved stable local id is persisted in the global data dir.
+      yield* showAdAndComplete(sid, SessionV1.MessageID.make("msg_local_credit"), "toolgap", (p) => Effect.succeed(p))
       const localId = yield* Effect.promise(() => Bun.file(LOCAL_ID_FILE).text())
       expect(localId.startsWith("cfu_")).toBe(true)
       const balance = yield* wallet.getBalance(localId)
-      expect(balance.balanceCredits).toBe(4)
-      expect(balance.lifetimeEarnedCredits).toBe(4)
+      expect(balance.balanceCredits).toBe(AD_VIEW_CREDIT_REWARD)
+      expect(balance.lifetimeEarnedCredits).toBe(AD_VIEW_CREDIT_REWARD)
     }),
   )
 
@@ -586,11 +623,10 @@ describe("stable local user id (VAL-SESSION-022/023/024)", () => {
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
       const sid = sessionID("local_usage")
-      // Earn 4 credits via an ad (credited to the stable local id).
-      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_lu"), "toolgap", (p) => Effect.succeed(p))
+      yield* showAdAndComplete(sid, SessionV1.MessageID.make("msg_lu"), "toolgap", (p) => Effect.succeed(p))
       const localId = yield* Effect.promise(() => Bun.file(LOCAL_ID_FILE).text())
       const before = yield* wallet.getBalance(localId)
-      expect(before.balanceCredits).toBe(4)
+      expect(before.balanceCredits).toBe(AD_VIEW_CREDIT_REWARD)
       // applyUsage on a small cost ($0.01 = 1 credit) debits the same local wallet.
       const uncovered = yield* CodeFree.applyUsage(sid, 0.01)
       expect(uncovered).toBe(0)
@@ -610,11 +646,10 @@ describe("remote account precedence (VAL-SESSION-025)", () => {
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
       const sid = sessionID("remote")
-      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_remote"), "toolgap", (p) => Effect.succeed(p))
-      // The remote account wallet is credited — the remote id takes precedence over the local id.
+      yield* showAdAndComplete(sid, SessionV1.MessageID.make("msg_remote"), "toolgap", (p) => Effect.succeed(p))
       const balance = yield* wallet.getBalance(REMOTE_USER_ID)
-      expect(balance.balanceCredits).toBe(4)
-      expect(balance.lifetimeEarnedCredits).toBe(4)
+      expect(balance.balanceCredits).toBe(AD_VIEW_CREDIT_REWARD)
+      expect(balance.lifetimeEarnedCredits).toBe(AD_VIEW_CREDIT_REWARD)
     }),
   )
 })
@@ -747,16 +782,13 @@ describe("ad credit then usage debit reconciles (VAL-SESSION-035)", () => {
     Effect.gen(function* () {
       const wallet = yield* Wallet.Service
       const sid = sessionID("reconcile")
-      // Earn 4 credits via an ad.
-      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_recon"), "toolgap", (p) => Effect.succeed(p))
-      // Spend 1 credit on a small cost ($0.01 = 1 credit).
+      yield* showAdAndComplete(sid, SessionV1.MessageID.make("msg_recon"), "toolgap", (p) => Effect.succeed(p))
       const uncovered = yield* CodeFree.applyUsage(sid, 0.01)
       expect(uncovered).toBe(0)
       const balance = yield* wallet.getBalance(TEST_USER_ID)
-      // Invariant: balance == earned - spent.
       expect(balance.balanceCredits).toBe(balance.lifetimeEarnedCredits - balance.lifetimeSpentCredits)
       expect(balance.balanceCredits).toBe(3)
-      expect(balance.lifetimeEarnedCredits).toBe(4)
+      expect(balance.lifetimeEarnedCredits).toBe(AD_VIEW_CREDIT_REWARD)
       expect(balance.lifetimeSpentCredits).toBe(1)
     }),
   )
@@ -913,10 +945,8 @@ describe("CodeFree clickAd credits the wallet +100 and emits events (VAL-SESSION
       const adStore = yield* Store.Service
       const sid = sessionID("click_full")
 
-      // Show an ad via the CodeFree service (credits +4 view + records impression).
-      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_view"), "toolgap", (p) => Effect.succeed(p))
+      yield* showAdAndComplete(sid, SessionV1.MessageID.make("msg_view"), "toolgap", (p) => Effect.succeed(p))
 
-      // Record a second manual impression directly so we have a known id to click.
       const impression = trackImpression(
         fetchAds(ConfigCodefree.toAdConfig(new ConfigCodefree.Info({ enabled: true })))[0],
         "toolgap",
@@ -980,6 +1010,94 @@ describe("CodeFree clickAd credits the wallet +100 and emits events (VAL-SESSION
         Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
       )
       expect(balance).toBeNull()
+    }),
+  )
+})
+
+// =====================================================================================
+// Dwell-verified impression loop (VAL-CF-030/031/032/033)
+// =====================================================================================
+
+describe("dwell-verified impressions (VAL-CF-030/031/032/033)", () => {
+  effEnabled.effect("VAL-CF-033: maybeShowAd no longer credits directly", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const sid = sessionID("no_direct_credit")
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_no_credit"), "toolgap", (p) => Effect.succeed(p))
+      const balance = yield* wallet.getBalance(TEST_USER_ID).pipe(
+        Effect.catchTag("WalletNotFoundError", () => Effect.succeed(null)),
+      )
+      expect(balance?.balanceCredits ?? 0).toBe(0)
+    }),
+  )
+
+  effEnabled.effect("VAL-CF-030: completeImpression credits once, rejects duplicate", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const sid = sessionID("complete_once")
+      const seen: Array<{ type: string; properties: Record<string, unknown> }> = []
+      const handler = (evt: { payload?: { type?: string; properties?: Record<string, unknown> } }) => {
+        const type = evt.payload?.type
+        if (typeof type === "string" && type.startsWith("codefree.")) {
+          seen.push({ type, properties: evt.payload!.properties! })
+        }
+      }
+      GlobalBus.on("event", handler)
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_complete_once"), "toolgap", (p) => Effect.succeed(p))
+      GlobalBus.off("event", handler)
+      const impressionId = seen.find((event) => event.type === "codefree.ad.impression")?.properties.impression_id
+      expect(typeof impressionId).toBe("string")
+      yield* backdateImpression(impressionId as string)
+      const first = yield* CodeFree.completeImpression(sid, impressionId as string)
+      const duplicate = yield* CodeFree.completeImpression(sid, impressionId as string)
+      expect(first.credited).toBe(true)
+      expect(duplicate.credited).toBe(false)
+      expect(duplicate.reason).toBe("duplicate")
+      const balance = yield* wallet.getBalance(TEST_USER_ID)
+      expect(balance.balanceCredits).toBe(AD_VIEW_CREDIT_REWARD)
+    }),
+  )
+
+  effEnabled.effect("VAL-CF-031: completeImpression rejects before slot_min_ms elapsed", () =>
+    Effect.gen(function* () {
+      const sid = sessionID("too_fast")
+      const seen: Array<{ type: string; properties: Record<string, unknown> }> = []
+      const handler = (evt: { payload?: { type?: string; properties?: Record<string, unknown> } }) => {
+        const type = evt.payload?.type
+        if (typeof type === "string" && type.startsWith("codefree.")) {
+          seen.push({ type, properties: evt.payload!.properties! })
+        }
+      }
+      GlobalBus.on("event", handler)
+      yield* CodeFree.maybeShowAd(sid, SessionV1.MessageID.make("msg_fast"), "toolgap", (p) => Effect.succeed(p))
+      GlobalBus.off("event", handler)
+      const impressionId = seen.find((event) => event.type === "codefree.ad.impression")?.properties.impression_id
+      expect(typeof impressionId).toBe("string")
+      const result = yield* CodeFree.completeImpression(sid, impressionId as string)
+      expect(result.credited).toBe(false)
+      expect(result.reason).toBe("too_fast")
+    }),
+  )
+
+  effEnabled.effect("VAL-CF-032: click credits 100 once and is blocked by daily cap", () =>
+    Effect.gen(function* () {
+      const wallet = yield* Wallet.Service
+      const adStore = yield* Store.Service
+      const sid = sessionID("click_cap")
+      yield* wallet.creditWallet(TEST_USER_ID, MAX_DAILY_CREDITS - 50, "affiliate_click", "near cap")
+
+      const impression = trackImpression(
+        fetchAds(ConfigCodefree.toAdConfig(new ConfigCodefree.Info({ enabled: true })))[0],
+        "toolgap",
+        sid,
+        TEST_USER_ID,
+        1000,
+      )
+      yield* adStore.recordImpression(impression)
+      yield* CodeFree.clickAd(sid, impression.id, "https://example.com/cap", "Cap ad")
+
+      const balance = yield* wallet.getBalance(TEST_USER_ID)
+      expect(balance.balanceCredits).toBe(MAX_DAILY_CREDITS - 50)
     }),
   )
 })

@@ -62,6 +62,7 @@ import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
 import { Toast, useToast } from "../../ui/toast"
+import { AdBannerLive } from "../../ui/ad-banner-live"
 import { useKV } from "../../context/kv.tsx"
 import stripAnsi from "strip-ansi"
 import { usePromptRef } from "../../context/prompt"
@@ -1345,6 +1346,7 @@ export function Session() {
               </box>
             </Show>
             <Toast />
+            <AdBannerLive />
           </box>
           <Show when={sidebarVisible()}>
             <Switch>
